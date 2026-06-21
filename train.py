@@ -24,8 +24,8 @@ HIDDEN_DIM = 128
 COND_DIM = HIDDEN_DIM * (2 * N_OBS + 1)
 N_EPOCHS = 150
 LR = 1e-4
-SAVE_EVERY = 50
-EVAL_EVERY = 5
+SAVE_EVERY = 17500
+EVAL_EVERY = 8750
 CHECKPOINT_DIR = "checkpoints"
 BATCH_SIZE = 64
 
@@ -46,7 +46,7 @@ def unnormalize(x):
 # =============================================================================
 # 1. Environment
 # =============================================================================
-def evaluate(policy, device, n_episodes=10, render=False, n_steps=10):
+def evaluate(policy, device, n_episodes=10, render=False, denoising_steps=10):
     render_mode = "human" if render else "rgb_array"
     env = gym.make(
         "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode=render_mode
@@ -72,7 +72,7 @@ def evaluate(policy, device, n_episodes=10, render=False, n_steps=10):
             states_in = states_buf.unsqueeze(0).to(device)  # (1, n_obs, 2)
 
             # generate a chunk of actions (in normalized [-1, 1] space)
-            actions = policy.inference(images_in, states_in, n_steps=n_steps)  # (1, n_actions, 2)
+            actions = policy.inference(images_in, states_in, denoising_steps=denoising_steps)  # (1, n_actions, 2)
             # back to the env's [0, 512] coordinate space
             actions = unnormalize(actions).squeeze(0).cpu().numpy()  # (n_actions, 2)
 
@@ -340,13 +340,13 @@ class DiTPolicy(nn.Module):
         return torch.nn.functional.mse_loss(v_pred, target)
 
     @torch.no_grad()
-    def inference(self, images, obs, n_steps=10):
+    def inference(self, images, obs, denoising_steps=10):
         batch_size = images.shape[0]
         x = torch.randn(batch_size, N_ACTIONS, 2).to(images.device)
 
-        dt = 1.0 / n_steps
-        for i in range(n_steps):
-            t = torch.full((batch_size,), i / n_steps).to(images.device)
+        dt = 1.0 / denoising_steps
+        for i in range(denoising_steps):
+            t = torch.full((batch_size,), i / denoising_steps).to(images.device)
             v = self.forward(x, t, images, obs)
             x = x + v * dt
         return x.clamp(-1.0, 1.0) 
@@ -373,7 +373,8 @@ def train(
     policy = policy.to(device)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     os.makedirs(checkpoint_dir, exist_ok=True)
-
+    
+    global_step = 0
     for epoch in range(n_epochs):
         total_loss = 0.0
         pbar = tqdm(dataloader, desc=f"epoch {epoch}")
@@ -389,25 +390,33 @@ def train(
 
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
+            global_step += 1
 
         avg_loss = total_loss / len(dataloader)
         log_dict = {"epoch": epoch, "avg_loss": avg_loss}
         print(f"epoch {epoch}: avg_loss={avg_loss:.4f}")
 
-        if epoch % eval_every == 0 or epoch == n_epochs - 1:
-            for n_steps in [1, 2, 5, 10, 20, 50]:
-                success_rate = evaluate(policy, device, n_episodes=20, n_steps=n_steps)
-                log_dict[f"success_rate/n_steps_{n_steps}"] = success_rate
+        if global_step % eval_every == 0:
+            for denoising_steps in [1, 2, 5, 10, 20, 50]:
+                success_rate = evaluate(
+                    policy,
+                    device,
+                    n_episodes=20,
+                    denoising_steps=denoising_steps,
+                )
+
+                log_dict[f"success_rate/denoising_steps_{denoising_steps}"] = success_rate
+
                 print(
-                    f"epoch {epoch}: n_steps={n_steps}, "
+                    f"epoch {epoch}: denoising_steps={denoising_steps}, "
                     f"success_rate={success_rate:.2f}"
                 )
 
         wandb.log(log_dict, step=epoch)
 
-        if epoch % save_every == 0 or epoch == n_epochs - 1:
+        if global_step % save_every == 0:
             checkpoint_path = os.path.join(
-                checkpoint_dir, f"checkpoint_epoch_{epoch}.pt"
+                checkpoint_dir, f"checkpoint_step_{global_step}.pt"
             )
             torch.save(
                 {
