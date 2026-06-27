@@ -42,8 +42,7 @@ WANDB_ENTITY = "robot_learning_collective"
 COORD_MIN, COORD_MAX = 0.0, 512.0
 IMG_SIZE = 224
 PRE_CROP_SIZE = 256  # resize target before random cropping to IMG_SIZE
-IMG_MEAN = [0.485, 0.456, 0.406]
-IMG_STD = [0.229, 0.224, 0.225]
+
 
 def normalize(x):
     return 2.0 * (x - COORD_MIN) / (COORD_MAX - COORD_MIN) - 1.0
@@ -190,10 +189,6 @@ class ImageEncoder(nn.Module):
             "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
         )
 
-        resnet.conv1 = nn.Conv2d(
-            3, 64, kernel_size=3, stride=1, padding=1, bias=False
-        )
-
         resnet.maxpool = nn.Identity()
 
         feat_dim = resnet.fc.in_features  # 512 for resnet34
@@ -202,7 +197,7 @@ class ImageEncoder(nn.Module):
         self.fc = nn.Linear(feat_dim, out_dim)
 
     def forward(self, images):
-        # images: (batch, 3, 96, 96)
+        # images: (batch, 3, 224, 224)
         images = (images - self.img_mean) / self.img_std
         
         x = self.backbone(images)
