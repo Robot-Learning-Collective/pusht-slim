@@ -1,5 +1,7 @@
+import argparse
 import math
 import os
+from contextlib import nullcontext
 from datetime import datetime
 import time
 
@@ -26,10 +28,10 @@ TOTAL_STEPS = 200_000
 LR = 1e-4
 LOG_EVERY = 200
 EVAL_EVERY = 25_000
-EVAL_EPISODES = 20
+EVAL_EPISODES = 100
 SAVE_EVERY = 25_000
 CHECKPOINT_DIR = "checkpoints"
-BATCH_SIZE = 64
+BATCH_SIZE = 512
 WANDB_PROJECT = "pushT-slim"
 WANDB_ENTITY = "robot_learning_collective"
 
@@ -38,6 +40,25 @@ WANDB_ENTITY = "robot_learning_collective"
 # so it lives at the same scale as the Gaussian noise used by flow matching,
 # then unnormalize the model's output before sending it back to the env.
 COORD_MIN, COORD_MAX = 0.0, 512.0
+
+
+from dataclasses import dataclass
+
+
+@dataclass
+class PerfConfig:
+    """Toggles for performance experiments so optimizations can be A/B tested
+    over real 1000-step runs without editing code."""
+    compile_mode: str = "step"   # none | wrap | step
+    amp: str = "bf16"            # none | bf16 | fp16
+    tf32: bool = True
+    num_workers: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
+    channels_last: bool = False
+    log_every: int = 100         # perf reporting cadence
+
 
 def normalize(x):
     return 2.0 * (x - COORD_MIN) / (COORD_MAX - COORD_MIN) - 1.0
@@ -74,6 +95,7 @@ class PushTAdapter:
 
 def evaluate(policy, device, n_episodes, render, n_steps):
     render_mode = "human" if render else "rgb_array"
+    t0 = time.perf_counter()
     env = gym.make(
         "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode=render_mode
     )
@@ -111,9 +133,17 @@ def evaluate(policy, device, n_episodes, render, n_steps):
 
     env.close()
     policy.train()
+
+    t_total = time.perf_counter() - t0
+    print(
+        f"[eval] {n_episodes} eps, n_steps={n_steps}: {t_total:.1f}s "
+        f"({t_total / n_episodes:.2f}s/ep)",
+        flush=True,
+    )
     return {
         "success_rate": successes / n_episodes,
         "avg_max_reward": sum(max_rewards) / n_episodes,
+        "eval/time_total_s": t_total,
     }
 
 
@@ -321,22 +351,34 @@ class DiTPolicy(nn.Module):
             ]
         )
 
-    def forward(self, x_t, t, images, obs):
-        # pure network: noisy actions + time + context -> predicted velocity
-        # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
-        # images: (batch, 3, 96, 96), obs: (batch, ROBOT_DOF)
+    def encode_context(self, images, obs):
+        # context depends only on the observation, NOT on the noisy action or the
+        # flow time t, so it's constant across a denoising loop and can be cached.
+        # This is the expensive part (ResNet34 backbone).
         images_cond = self.image_encoder(images)
         obs_cond = self.state_encoder(obs)
+        return images_cond, obs_cond
+
+    def forward_with_context(self, x_t, t, context):
+        # per-step network given a precomputed observation context.
+        images_cond, obs_cond = context
         timestep_cond = self.timestep_encoder(t)
         cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
         cond = self.cond_proj(cond)
 
         x = self.action_proj(x_t)
         x = x + self.action_pos_emb
-        
+
         for block in self.blocks:
             x = block(x, cond)
         return self.action_out(x)
+
+    def forward(self, x_t, t, images, obs):
+        # pure network: noisy actions + time + context -> predicted velocity
+        # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
+        # images: (batch, 3, 96, 96), obs: (batch, ROBOT_DOF)
+        context = self.encode_context(images, obs)
+        return self.forward_with_context(x_t, t, context)
 
     def training_step(self, images, obs, actions):
         t = torch.rand(actions.shape[0]).to(actions.device)
@@ -353,11 +395,14 @@ class DiTPolicy(nn.Module):
         x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF).to(images.device)
 
         dt = 1.0 / n_steps
+        # encode the observation context ONCE and reuse it for every denoising
+        # step (the backbone depends only on images/obs, not on x or t).
+        context = self.encode_context(images, obs)
         for i in range(n_steps):
             t = torch.full((batch_size,), i / n_steps).to(images.device)
-            v = self.forward(x, t, images, obs)
+            v = self.forward_with_context(x, t, context)
             x = x + v * dt
-        return x.clamp(-1.0, 1.0) 
+        return x.clamp(-1.0, 1.0)
 
 
 # =============================================================================
@@ -381,6 +426,12 @@ def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
     print(f"Saved checkpoint to {checkpoint_path}")
 
 
+def _sync(device):
+    # make CUDA kernels finish so wall-clock timings reflect real GPU work
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def train(
     policy,
     dataloader,
@@ -390,39 +441,131 @@ def train(
     eval_every=EVAL_EVERY,
     save_every=SAVE_EVERY,
     checkpoint_dir=CHECKPOINT_DIR,
+    perf=None,
 ):
+    perf = perf or PerfConfig()
+
+    def run_eval():
+        return evaluate(
+            policy, device, n_episodes=EVAL_EPISODES, render=False,
+            n_steps=N_DENOISING_STEPS,
+        )
     device = torch.device(
         "mps"
         if torch.backends.mps.is_available()
         else "cuda" if torch.cuda.is_available() else "cpu"
     )
     print(f"Training on {device}")
+    print(f"Perf config: {perf}")
+
+    # ---- optional global backend toggles (matmul precision / TF32) ----
+    if perf.tf32 and device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
     policy = policy.to(device)
-    policy = torch.compile(policy)
+    if perf.channels_last and device.type == "cuda":
+        policy = policy.to(memory_format=torch.channels_last)
+
+    # ---- compile strategy ----
+    # "wrap":  torch.compile(policy) — note training calls policy.training_step,
+    #          which routes through the *uncompiled* forward, so this is ~a no-op.
+    # "step":  compile the training_step callable so the fwd/bwd graph is actually
+    #          compiled (the real fix).
+    # "none":  eager.
+    train_step_fn = policy.training_step
+    if perf.compile_mode == "wrap":
+        policy = torch.compile(policy)
+        train_step_fn = policy.training_step
+    elif perf.compile_mode == "step":
+        train_step_fn = torch.compile(policy.training_step)
+
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # ---- AMP setup ----
+    if perf.amp == "bf16" and device.type == "cuda":
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+        scaler = None
+    elif perf.amp == "fp16" and device.type == "cuda":
+        autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+        scaler = torch.amp.GradScaler("cuda")
+    else:
+        autocast_ctx = nullcontext()
+        scaler = None
 
     last_loss = 0.0
     global_step = 0
     dataloader_iter = iter(dataloader)
 
+    # ---- perf accumulators (reset every perf.log_every window) ----
+    win_data = 0.0      # time spent waiting on next(dataloader)
+    win_h2d = 0.0       # host->device transfer
+    win_compute = 0.0   # fwd + bwd + optimizer (GPU work)
+    win_wall0 = time.perf_counter()
+    train_wall0 = time.perf_counter()
+    first_step_done = False
+
     for global_step in range(1, total_steps + 1):
+        t0 = time.perf_counter()
         try:
             batch = next(dataloader_iter)
         except StopIteration:
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
+        t_data = time.perf_counter()
 
-        images = batch["images"].to(device)
-        obs = batch["obs"].to(device)
-        actions = batch["actions"].to(device)
+        images = batch["images"].to(device, non_blocking=perf.pin_memory)
+        obs = batch["obs"].to(device, non_blocking=perf.pin_memory)
+        actions = batch["actions"].to(device, non_blocking=perf.pin_memory)
+        if perf.channels_last and device.type == "cuda":
+            images = images.to(memory_format=torch.channels_last)
+        _sync(device)
+        t_h2d = time.perf_counter()
 
-        loss = policy.training_step(images, obs, actions)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        with autocast_ctx:
+            loss = train_step_fn(images, obs, actions)
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        _sync(device)
+        t_compute = time.perf_counter()
 
         last_loss = loss.item()
+
+        win_data += t_data - t0
+        win_h2d += t_h2d - t_data
+        win_compute += t_compute - t_h2d
+
+        # cold start vs steady state: the first step pays compile + cudnn
+        # autotune + lazy CUDA init, so report it separately.
+        if not first_step_done:
+            first_step_done = True
+            cold_start_s = t_compute - train_wall0
+            first_step_s = t_compute - t0
+            print(
+                f"[perf] first step done: cold_start={cold_start_s:.2f}s "
+                f"(setup+compile+step1), step1_wall={first_step_s:.2f}s, "
+                f"data={t_data - t0:.3f}s h2d={t_h2d - t_data:.3f}s "
+                f"compute={t_compute - t_h2d:.3f}s",
+                flush=True,
+            )
+            wandb.log(
+                {
+                    "perf/cold_start_s": cold_start_s,
+                    "perf/first_step_s": first_step_s,
+                },
+                step=global_step,
+            )
+            # don't let the cold first step pollute steady-state averages
+            win_data = win_h2d = win_compute = 0.0
+            win_wall0 = time.perf_counter()
 
         # collect everything due on this step into one log call so wandb sees
         # a single record per step (log and eval cadences can coincide)
@@ -431,61 +574,130 @@ def train(
             log_dict["loss"] = last_loss
             print(f"step {global_step}: loss={last_loss:.4f}")
 
-        if global_step % eval_every == 0:
-            log_dict.update(evaluate(
-                policy, device, n_episodes=EVAL_EPISODES, render=False,
-                n_steps=N_DENOISING_STEPS,
-            ))
+        # perf window report (skips the cold first step)
+        if global_step % perf.log_every == 0 and global_step > 1:
+            win_wall = time.perf_counter() - win_wall0
+            n = perf.log_every if global_step != perf.log_every else perf.log_every - 1
+            steps_per_s = n / win_wall if win_wall > 0 else 0.0
+            data_ms = 1000 * win_data / n
+            h2d_ms = 1000 * win_h2d / n
+            compute_ms = 1000 * win_compute / n
+            log_dict.update({
+                "perf/steps_per_s": steps_per_s,
+                "perf/ms_per_step": 1000 * win_wall / n,
+                "perf/data_ms": data_ms,
+                "perf/h2d_ms": h2d_ms,
+                "perf/compute_ms": compute_ms,
+            })
+            print(
+                f"[perf] step {global_step}: {steps_per_s:.1f} it/s "
+                f"({1000 * win_wall / n:.1f} ms/step) | "
+                f"data={data_ms:.1f} h2d={h2d_ms:.1f} compute={compute_ms:.1f} ms",
+                flush=True,
+            )
+            win_data = win_h2d = win_compute = 0.0
+            win_wall0 = time.perf_counter()
+
+        if eval_every and global_step % eval_every == 0:
+            log_dict.update(run_eval())
 
         if log_dict:
             wandb.log(log_dict, step=global_step)
 
-        if global_step % save_every == 0:
+        if save_every and global_step % save_every == 0:
             save_checkpoint(
                 policy, optimizer, global_step, last_loss, checkpoint_dir
             )
 
+    total_wall = time.perf_counter() - train_wall0
+    print(
+        f"[perf] finished {total_steps} steps in {total_wall:.1f}s "
+        f"(avg {total_steps / total_wall:.1f} it/s incl. cold start)",
+        flush=True,
+    )
+
     # final eval + checkpoint, unless the last step already triggered them
     final_dict = {}
-    if total_steps % eval_every != 0:
-        final_dict.update(evaluate(
-            policy, device, n_episodes=EVAL_EPISODES, render=False,
-            n_steps=N_DENOISING_STEPS,
-        ))
+    if eval_every and total_steps % eval_every != 0:
+        final_dict.update(run_eval())
     if final_dict:
         wandb.log(final_dict, step=global_step)
-    if total_steps % save_every != 0:
+    if save_every and total_steps % save_every != 0:
         save_checkpoint(policy, optimizer, global_step, last_loss, checkpoint_dir)
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Train PushT DiT policy (+ perf knobs).")
+    p.add_argument("--steps", type=int, default=TOTAL_STEPS,
+                   help="total training steps (use e.g. 1000 for perf runs)")
+    p.add_argument("--compile-mode", default="step",
+                   choices=["none", "wrap", "step"],
+                   help="torch.compile strategy ('wrap' replicates the old no-op)")
+    p.add_argument("--amp", default="bf16", choices=["none", "bf16", "fp16"])
+    p.add_argument("--tf32", dest="tf32", action="store_true", default=True)
+    p.add_argument("--no-tf32", dest="tf32", action="store_false")
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--pin-memory", dest="pin_memory", action="store_true", default=True)
+    p.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
+    p.add_argument("--channels-last", action="store_true", default=False)
+    p.add_argument("--perf-log-every", type=int, default=100)
+    p.add_argument("--eval-every", type=int, default=EVAL_EVERY)
+    p.add_argument("--save-every", type=int, default=SAVE_EVERY)
+    p.add_argument("--run-name", default=None)
+    p.add_argument("--wandb-mode", default="online",
+                   choices=["online", "offline", "disabled"])
+    return p.parse_args()
+
+
 def main():
-    run_name = f"pusht-dit-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+    args = parse_args()
+    perf = PerfConfig(
+        compile_mode=args.compile_mode,
+        amp=args.amp,
+        tf32=args.tf32,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+        channels_last=args.channels_last,
+        log_every=args.perf_log_every,
+    )
+
+    run_name = args.run_name or f"pusht-dit-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 
     policy = DiTPolicy()
     dataset = PushTDataset(
         dataset_id=DATASET_ID,
         prediction_horizon=PREDICTION_HORIZON,
     )
-    dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
+    loader_kwargs = dict(
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=perf.num_workers,
+        pin_memory=perf.pin_memory,
     )
+    if perf.num_workers > 0:
+        loader_kwargs["persistent_workers"] = perf.persistent_workers
+        loader_kwargs["prefetch_factor"] = perf.prefetch_factor
+    dataloader = DataLoader(dataset, **loader_kwargs)
 
     steps_per_epoch = len(dataloader)
     print(
-        f"steps/epoch={steps_per_epoch}, training for {TOTAL_STEPS} total steps "
-        f"(~{math.ceil(TOTAL_STEPS / steps_per_epoch)} passes over the data)"
+        f"steps/epoch={steps_per_epoch}, training for {args.steps} total steps "
+        f"(~{math.ceil(args.steps / steps_per_epoch)} passes over the data)"
     )
 
     wandb.init(
         project=WANDB_PROJECT,
         entity=WANDB_ENTITY,
         name=run_name,
+        mode=args.wandb_mode,
         config={
-            "total_steps": TOTAL_STEPS,
+            "total_steps": args.steps,
             "steps_per_epoch": steps_per_epoch,
             "log_every": LOG_EVERY,
-            "eval_every": EVAL_EVERY,
+            "eval_every": args.eval_every,
             "eval_episodes": EVAL_EPISODES,
-            "save_every": SAVE_EVERY,
+            "save_every": args.save_every,
             "lr": LR,
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
@@ -496,10 +708,23 @@ def main():
             "action_chunk_size": ACTION_CHUNK_SIZE,
             "n_denoising_steps": N_DENOISING_STEPS,
             "batch_size": BATCH_SIZE,
+            "compile_mode": perf.compile_mode,
+            "amp": perf.amp,
+            "tf32": perf.tf32,
+            "num_workers": perf.num_workers,
+            "pin_memory": perf.pin_memory,
+            "channels_last": perf.channels_last,
         },
     )
 
-    train(policy=policy, dataloader=dataloader)
+    train(
+        policy=policy,
+        dataloader=dataloader,
+        total_steps=args.steps,
+        eval_every=args.eval_every,
+        save_every=args.save_every,
+        perf=perf,
+    )
 
     wandb.finish()
 
