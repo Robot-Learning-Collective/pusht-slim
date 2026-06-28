@@ -7,13 +7,13 @@ import wandb
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.models as models
 import torchvision.transforms as T
-import torchvision.transforms.functional as TF
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
-import gym_pusht  
+import gym_pusht
 
 ROBOT_DOF = 2
 PREDICTION_HORIZON = 16
@@ -26,6 +26,7 @@ N_LAYERS = 6
 HIDDEN_DIM = 600
 TOTAL_STEPS = 200_000
 LR = 1e-4
+WARMUP_STEPS = 1_000
 LOG_EVERY = 200
 EVAL_EVERY = 25_000
 EVAL_EPISODES = 20
@@ -40,8 +41,8 @@ WANDB_ENTITY = "robot_learning_collective"
 # so it lives at the same scale as the Gaussian noise used by flow matching,
 # then unnormalize the model's output before sending it back to the env.
 COORD_MIN, COORD_MAX = 0.0, 512.0
-IMG_SIZE = 224
-PRE_CROP_SIZE = 256  # resize target before random cropping to IMG_SIZE
+CROP_SIZE = 84       # random crop (train) / center crop (eval), ~0.875 of native
+NUM_KEYPOINTS = 32   # SpatialSoftmax keypoints
 
 
 def normalize(x):
@@ -67,7 +68,8 @@ class PushTAdapter:
         self.device = device
 
     def observe(self, obs):
-        # env obs dict -> batched, normalized (images, states) on device
+        # Raw native-resolution frame — cropping and normalization happen inside
+        # the encoder (center crop in eval mode) so train/eval share one path.
         image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1).float() / 255.0
         state = normalize(torch.from_numpy(obs["agent_pos"]).float())
         return image.unsqueeze(0).to(self.device), state.unsqueeze(0).to(self.device)
@@ -129,15 +131,14 @@ class PushTDataset(Dataset):
     def __init__(self, dataset_id, prediction_horizon):
         self.dataset = LeRobotDataset(dataset_id)
         self.prediction_horizon = prediction_horizon
-        self.random_crop = T.RandomCrop(IMG_SIZE)
 
-        # decode every frame once and keep it in RAM; afterwards each __getitem__
+        # decode every frame once and keep it in RAM as uint8 (4x less memory)
         print("Caching dataset in memory...")
         self.cache = {}
         for idx in range(len(self.dataset)):
             item = self.dataset[idx]
             self.cache[idx] = {
-                "observation.image": item["observation.image"],
+                "observation.image": (item["observation.image"] * 255).to(torch.uint8),
                 "observation.state": item["observation.state"],
                 "action": item["action"],
             }
@@ -150,18 +151,13 @@ class PushTDataset(Dataset):
     def __getitem__(self, idx):
         current_episode = self.episode_indices[idx]
 
-        img = TF.resize(
-            self.cache[idx]["observation.image"],
-            [PRE_CROP_SIZE, PRE_CROP_SIZE],
-            antialias=True,)
-        
-        img = self.random_crop(img)
+        img = self.cache[idx]["observation.image"].float() / 255.0
 
         obs = normalize(self.cache[idx]["observation.state"])
 
         actions = torch.zeros(self.prediction_horizon, 2)
         mask = torch.zeros(self.prediction_horizon, 2)
-        
+
         for k in range(self.prediction_horizon):
             i = idx + k
             if i < len(self.dataset) and self.episode_indices[i] == current_episode:
@@ -170,17 +166,58 @@ class PushTDataset(Dataset):
 
         return img, obs, actions.flatten(), mask.flatten()
 
+
 # =============================================================================
 # 3. Model
 # =============================================================================
+class SpatialSoftmax(nn.Module):
+    """Spatial soft-argmax pooling (Finn et al. 2015).
+
+    Converts a (B, C, H, W) feature map into (B, num_kp, 2) keypoint coordinates:
+    the softmax-weighted center of mass of each channel. Preserves spatial
+    information that global average pooling discards — critical when the feature
+    map is tiny (e.g. 3x3 from a stock ResNet on an 84x84 crop).
+    """
+
+    def __init__(self, input_shape, num_kp=None):
+        super().__init__()
+        self._in_c, self._in_h, self._in_w = input_shape
+        if num_kp is not None:
+            self.nets = nn.Conv2d(self._in_c, num_kp, kernel_size=1)
+            self._out_c = num_kp
+        else:
+            self.nets = None
+            self._out_c = self._in_c
+
+        pos_x, pos_y = np.meshgrid(
+            np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h)
+        )
+        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
+        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
+        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+
+    def forward(self, features):
+        if self.nets is not None:
+            features = self.nets(features)
+        batch = features.shape[0]
+        features = features.reshape(-1, self._in_h * self._in_w)
+        attention = F.softmax(features, dim=-1)
+        keypoints = attention @ self.pos_grid  # (B * out_c, 2)
+        return keypoints.reshape(batch, self._out_c, 2)
+
+
 class ImageEncoder(nn.Module):
-    def __init__(self, out_dim):
+    """ResNet34 + SpatialSoftmax at native 96x96 resolution.
+
+    Cropping lives here (random in train, center in eval) so the dataset and
+    eval adapter both just pass raw frames — no separate resize/crop paths.
+    """
+
+    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
         super().__init__()
         weights = models.ResNet34_Weights.DEFAULT
         resnet = models.resnet34(weights=weights)
 
-        # Reuse the exact normalization the pretrained weights expect, sourced
-        # from the weights metadata so it can't drift out of sync.
         preprocess = weights.transforms()
         self.register_buffer(
             "img_mean", torch.tensor(preprocess.mean).view(1, 3, 1, 1)
@@ -189,19 +226,24 @@ class ImageEncoder(nn.Module):
             "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
         )
 
-        resnet.maxpool = nn.Identity()
+        self.random_crop = T.RandomCrop(crop_size)
+        self.center_crop = T.CenterCrop(crop_size)
 
-        feat_dim = resnet.fc.in_features  # 512 for resnet34
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        # Drop avgpool + fc; keep stem and conv stages to produce a feature map.
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        self.fc = nn.Linear(feat_dim, out_dim)
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, crop_size, crop_size)
+            feat_shape = self.backbone(dummy).shape[1:]  # (C, H, W)
+        self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
+        self.fc = nn.Linear(num_kp * 2, out_dim)
 
     def forward(self, images):
-        # images: (batch, 3, 224, 224)
+        # images: (batch, 3, 96, 96) in [0, 1]
+        images = self.random_crop(images) if self.training else self.center_crop(images)
         images = (images - self.img_mean) / self.img_std
-        
         x = self.backbone(images)
-        x = x.flatten(1) 
+        x = self.pool(x).flatten(1)  # (batch, num_kp * 2)
         return self.fc(x)
 
 
@@ -213,7 +255,6 @@ class StateEncoder(nn.Module):
         )
 
     def forward(self, state):
-        # state: (batch, ROBOT_DOF)
         return self.mlp(state)
 
 
@@ -228,46 +269,38 @@ class TimestepEncoder(nn.Module):
         )
 
     def forward(self, t):
-        # t: (batch,)
         half = self.out_dim // 2
         freqs = torch.exp(-math.log(10000) * torch.arange(half) / half).to(t.device)
-        x = t[:, None] * freqs[None, :]  # (batch, half)
-        x = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)  # (batch, out_dim)
+        x = t[:, None] * freqs[None, :]
+        x = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
         return self.mlp(x)
 
 
 class AdaLNBlock(nn.Module):
     def __init__(self, hidden_dim, n_heads):
         super().__init__()
-        # turns the conditioning vector into scale1, shift1, alpha1, scale2, shift2, alpha2
         self.adaLN_modulation = nn.Linear(hidden_dim, hidden_dim * 6)
-
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.attention = nn.MultiheadAttention(hidden_dim, n_heads, batch_first=True)
-
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
-
         nn.init.zeros_(self.adaLN_modulation.weight)
         nn.init.zeros_(self.adaLN_modulation.bias)
 
     def forward(self, x, cond):
-        # x: (batch, PREDICTION_HORIZON, hidden_dim), cond: (batch, hidden_dim)
         scale1, shift1, alpha1, scale2, shift2, alpha2 = self.adaLN_modulation(
             cond
         ).chunk(6, dim=-1)
 
-        # attention sub-block with adaptive LayerNorm
         x1 = self.norm1(x)
         x1 = scale1.unsqueeze(1) * x1 + shift1.unsqueeze(1)
         x1, _ = self.attention(x1, x1, x1)
         x = x + alpha1.unsqueeze(1) * x1
 
-        # MLP sub-block with adaptive LayerNorm
         x2 = self.norm2(x)
         x2 = scale2.unsqueeze(1) * x2 + shift2.unsqueeze(1)
         x = x + alpha2.unsqueeze(1) * self.mlp(x2)
@@ -283,7 +316,6 @@ class DiTPolicy(nn.Module):
         prediction_horizon=PREDICTION_HORIZON,
     ):
         super().__init__()
-        # conditioning = image + state + timestep, all hidden_dim wide
         self.image_encoder = ImageEncoder(out_dim=hidden_dim)
         self.timestep_encoder = TimestepEncoder(out_dim=hidden_dim)
         self.state_encoder = StateEncoder(out_dim=hidden_dim)
@@ -302,25 +334,18 @@ class DiTPolicy(nn.Module):
         )
 
         self.blocks = nn.ModuleList(
-            [
-                AdaLNBlock(hidden_dim=hidden_dim, n_heads=n_heads)
-                for _ in range(n_layers)
-            ]
+            [AdaLNBlock(hidden_dim=hidden_dim, n_heads=n_heads) for _ in range(n_layers)]
         )
 
     def forward(self, x_t, t, images, obs):
-        # pure network: noisy actions + time + context -> predicted velocity
-        # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
-        # images: (batch, 3, 96, 96), obs: (batch, ROBOT_DOF)
+        # x_t: (B, PREDICTION_HORIZON, ROBOT_DOF), t: (B,)
+        # images: (B, 3, 96, 96), obs: (B, ROBOT_DOF)
         images_cond = self.image_encoder(images)
         obs_cond = self.state_encoder(obs)
         timestep_cond = self.timestep_encoder(t)
-        cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
-        cond = self.cond_proj(cond)
+        cond = self.cond_proj(torch.cat([images_cond, obs_cond, timestep_cond], dim=-1))
 
-        x = self.action_proj(x_t)
-        x = x + self.action_pos_emb
-        
+        x = self.action_proj(x_t) + self.action_pos_emb
         for block in self.blocks:
             x = block(x, cond)
         return self.action_out(x)
@@ -330,13 +355,14 @@ class DiTPolicy(nn.Module):
         actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
         masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
 
-        t = torch.rand(B).to(actions.device)
+        # Logit-normal sampling: more weight on middle timesteps (harder to denoise)
+        t = torch.sigmoid(torch.randn(B, device=actions.device))
         noise = torch.randn_like(actions)
         x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
 
         v_pred = self.forward(x_t, t, images, obs)
-        loss = torch.nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
-        return (loss * masks).sum(1).mean()
+        loss = F.mse_loss(v_pred, actions - noise, reduction="none")
+        return (loss * masks).sum() / masks.sum().clamp(min=1)
 
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
@@ -348,23 +374,21 @@ class DiTPolicy(nn.Module):
             t = torch.full((batch_size,), i / n_steps).to(images.device)
             v = self.forward(x, t, images, obs)
             x = x + v * dt
-        return x.clamp(-1.0, 1.0) 
+        return x.clamp(-1.0, 1.0)
 
 
 # =============================================================================
 # 4. Training
 # =============================================================================
-def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
+def save_checkpoint(policy, optimizer, global_step, scheduler, loss, checkpoint_dir):
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
-
-    # torch.compile wraps the model and stores the real model in _orig_mod.
-    # Save the real model so checkpoint keys match a normal, uncompiled model.
     model = policy._orig_mod if hasattr(policy, "_orig_mod") else policy
     torch.save(
         {
             "step": global_step,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "loss": loss,
         },
         checkpoint_path,
@@ -389,8 +413,22 @@ def train(
     )
     print(f"Training on {device}")
     policy = policy.to(device)
+
+    # Encoder at 10% LR — it's pretrained, DiT is randomly initialised
+    optimizer = torch.optim.AdamW([
+        {"params": policy.image_encoder.parameters(), "lr": lr * 0.1},
+        {"params": [p for n, p in policy.named_parameters()
+                    if not n.startswith("image_encoder.")], "lr": lr},
+    ], weight_decay=1e-4)
+
+    def lr_lambda(step):
+        if step < WARMUP_STEPS:
+            return step / max(1, WARMUP_STEPS)
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     policy = torch.compile(policy)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     last_loss = 0.0
@@ -409,7 +447,9 @@ def train(
         loss = policy.training_step(images, obs, actions, mask)
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
+        scheduler.step()
 
         last_loss = loss.item()
 
@@ -418,6 +458,7 @@ def train(
         log_dict = {}
         if global_step % log_every == 0:
             log_dict["loss"] = last_loss
+            log_dict["lr"] = scheduler.get_last_lr()[1]  # DiT group
             print(f"step {global_step}: loss={last_loss:.4f}")
 
         if global_step % eval_every == 0:
@@ -430,9 +471,7 @@ def train(
             wandb.log(log_dict, step=global_step)
 
         if global_step % save_every == 0:
-            save_checkpoint(
-                policy, optimizer, global_step, last_loss, checkpoint_dir
-            )
+            save_checkpoint(policy, optimizer, global_step, scheduler, last_loss, checkpoint_dir)
 
     # final eval + checkpoint, unless the last step already triggered them
     final_dict = {}
@@ -444,7 +483,8 @@ def train(
     if final_dict:
         wandb.log(final_dict, step=global_step)
     if total_steps % save_every != 0:
-        save_checkpoint(policy, optimizer, global_step, last_loss, checkpoint_dir)
+        save_checkpoint(policy, optimizer, global_step, scheduler, last_loss, checkpoint_dir)
+
 
 def main():
     run_name = f"pusht-dit-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
@@ -455,7 +495,7 @@ def main():
         prediction_horizon=PREDICTION_HORIZON,
     )
     dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
+        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, persistent_workers=True
     )
 
     steps_per_epoch = len(dataloader)
@@ -480,6 +520,9 @@ def main():
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
             "backbone": "resnet34",
+            "pooling": "spatial_softmax",
+            "num_keypoints": NUM_KEYPOINTS,
+            "crop_size": CROP_SIZE,
             "robot_dof": ROBOT_DOF,
             "prediction_horizon": PREDICTION_HORIZON,
             "action_chunk_size": ACTION_CHUNK_SIZE,
