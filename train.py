@@ -532,6 +532,10 @@ def train(
         with torch.no_grad():
             for ema_p, p in zip(ema_policy.parameters(), src.parameters()):
                 ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+            # Buffers (e.g. BatchNorm running_mean/var) are not parameters —
+            # copy them directly so the EMA model's BN stats stay current.
+            for ema_buf, buf in zip(ema_policy.buffers(), src.buffers()):
+                ema_buf.data.copy_(buf.data)
 
         last_loss = loss.item()
         t_step_end = time.perf_counter()
