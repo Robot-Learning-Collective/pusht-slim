@@ -35,7 +35,7 @@ LOG_EVERY = 200
 EVAL_EVERY = 5_000
 EVAL_EPISODES = 20
 SAVE_EVERY = 25_000
-RUN_NAME = f"pusht-dit-bs512-lr1e4-50k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"pusht-dit-ema-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -567,6 +567,7 @@ def train(
                 ema_policy, device, n_episodes=EVAL_EPISODES, render=False,
                 n_steps=N_DENOISING_STEPS,
             ))
+            ema_policy.eval()  # evaluate() calls policy.train() at the end; undo that
 
         if log_dict:
             wandb.log(log_dict, step=global_step)
@@ -583,6 +584,7 @@ def train(
             ema_policy, device, n_episodes=EVAL_EPISODES, render=False,
             n_steps=N_DENOISING_STEPS,
         ))
+        ema_policy.eval()
     if final_dict:
         wandb.log(final_dict, step=global_step)
     if total_steps % save_every != 0:
