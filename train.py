@@ -31,11 +31,13 @@ LR = 1e-4
 # total pre-clip grad norm, which we log to watch for instability. Set to a
 # float (nanoGPT uses 1.0) to also clip; None measures the norm without clipping.
 GRAD_CLIP = None
+WARMUP_STEPS = 500   # linear LR warmup
+LR_MIN = 1e-6        # cosine decay floor
 LOG_EVERY = 200
 EVAL_EVERY = 5_000
 EVAL_EPISODES = 20
 SAVE_EVERY = 25_000
-RUN_NAME = f"pusht-dit-ema-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"ema-cosine_lr-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -423,7 +425,7 @@ class DiTPolicy(nn.Module):
 # =============================================================================
 # 4. Training
 # =============================================================================
-def save_checkpoint(policy, ema_policy, optimizer, global_step, loss, checkpoint_dir):
+def save_checkpoint(policy, ema_policy, optimizer, scheduler, global_step, loss, checkpoint_dir):
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
 
     # torch.compile wraps the model and stores the real model in _orig_mod.
@@ -435,6 +437,7 @@ def save_checkpoint(policy, ema_policy, optimizer, global_step, loss, checkpoint
             "model_state_dict": model.state_dict(),
             "ema_model_state_dict": ema_policy.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "loss": loss,
         },
         checkpoint_path,
@@ -487,6 +490,15 @@ def train(
     policy = torch.compile(policy)
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
+
+    def lr_lambda(step):
+        if step < WARMUP_STEPS:
+            return (step + 1) / WARMUP_STEPS
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return LR_MIN / lr + (1.0 - LR_MIN / lr) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     last_loss = 0.0
@@ -525,6 +537,7 @@ def train(
             max_norm=GRAD_CLIP if GRAD_CLIP is not None else float("inf"),
         )
         optimizer.step()
+        scheduler.step()
 
         # EMA: warm-ramp decay (fast early, asymptotes to 0.9999 ~31k steps)
         ema_decay = min(1 - (1 + global_step) ** (-0.75), 0.9999)
@@ -553,6 +566,7 @@ def train(
             it_per_s = 1e3 / step_ms if step_ms > 0 else 0.0
             grad_norm_val = grad_norm.item()
             log_dict["loss"] = last_loss
+            log_dict["lr"] = scheduler.get_last_lr()[0]
             log_dict["grad_norm"] = grad_norm_val
             log_dict["time/data_ms"] = data_ms
             log_dict["time/compute_ms"] = compute_ms
@@ -578,7 +592,7 @@ def train(
 
         if global_step % save_every == 0:
             save_checkpoint(
-                policy, ema_policy, optimizer, global_step, last_loss, checkpoint_dir
+                policy, ema_policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir
             )
 
     # final eval + checkpoint, unless the last step already triggered them
@@ -592,7 +606,7 @@ def train(
     if final_dict:
         wandb.log(final_dict, step=global_step)
     if total_steps % save_every != 0:
-        save_checkpoint(policy, ema_policy, optimizer, global_step, last_loss, checkpoint_dir)
+        save_checkpoint(policy, ema_policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir)
 
 def main():
 
@@ -629,6 +643,8 @@ def main():
             "eval_episodes": EVAL_EPISODES,
             "save_every": SAVE_EVERY,
             "lr": LR,
+            "lr_min": LR_MIN,
+            "warmup_steps": WARMUP_STEPS,
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
