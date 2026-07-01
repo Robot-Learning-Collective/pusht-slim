@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 from datetime import datetime
@@ -422,7 +423,7 @@ class DiTPolicy(nn.Module):
 # =============================================================================
 # 4. Training
 # =============================================================================
-def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
+def save_checkpoint(policy, ema_policy, optimizer, global_step, loss, checkpoint_dir):
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
 
     # torch.compile wraps the model and stores the real model in _orig_mod.
@@ -432,6 +433,7 @@ def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
         {
             "step": global_step,
             "model_state_dict": model.state_dict(),
+            "ema_model_state_dict": ema_policy.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "loss": loss,
         },
@@ -478,6 +480,10 @@ def train(
     torch.set_float32_matmul_precision("high")
 
     policy = policy.to(device)
+
+    ema_policy = copy.deepcopy(policy)
+    ema_policy.eval()
+
     policy = torch.compile(policy)
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
@@ -520,6 +526,13 @@ def train(
         )
         optimizer.step()
 
+        # EMA: warm-ramp decay (fast early, asymptotes to 0.9999 ~31k steps)
+        ema_decay = min(1 - (1 + global_step) ** (-0.75), 0.9999)
+        src = policy._orig_mod if hasattr(policy, "_orig_mod") else policy
+        with torch.no_grad():
+            for ema_p, p in zip(ema_policy.parameters(), src.parameters()):
+                ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+
         last_loss = loss.item()
         t_step_end = time.perf_counter()
 
@@ -551,7 +564,7 @@ def train(
 
         if global_step % eval_every == 0:
             log_dict.update(evaluate(
-                policy, device, n_episodes=EVAL_EPISODES, render=False,
+                ema_policy, device, n_episodes=EVAL_EPISODES, render=False,
                 n_steps=N_DENOISING_STEPS,
             ))
 
@@ -560,20 +573,20 @@ def train(
 
         if global_step % save_every == 0:
             save_checkpoint(
-                policy, optimizer, global_step, last_loss, checkpoint_dir
+                policy, ema_policy, optimizer, global_step, last_loss, checkpoint_dir
             )
 
     # final eval + checkpoint, unless the last step already triggered them
     final_dict = {}
     if total_steps % eval_every != 0:
         final_dict.update(evaluate(
-            policy, device, n_episodes=EVAL_EPISODES, render=False,
+            ema_policy, device, n_episodes=EVAL_EPISODES, render=False,
             n_steps=N_DENOISING_STEPS,
         ))
     if final_dict:
         wandb.log(final_dict, step=global_step)
     if total_steps % save_every != 0:
-        save_checkpoint(policy, optimizer, global_step, last_loss, checkpoint_dir)
+        save_checkpoint(policy, ema_policy, optimizer, global_step, last_loss, checkpoint_dir)
 
 def main():
 
