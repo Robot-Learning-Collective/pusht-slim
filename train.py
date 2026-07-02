@@ -23,7 +23,14 @@ ACTION_CHUNK_SIZE = 8
 # policy velocity/temporal context and matches lerobot's Diffusion Policy default;
 # the extra frames are flattened into the global conditioning vector.
 OBS_HORIZON = 2
-N_DENOISING_STEPS = 10
+# Generative objective for the action head.
+#   "flow"      -> flow matching (velocity target, Euler integration).
+#   "diffusion" -> DDPM with a cosine (squaredcos_cap_v2) beta schedule and
+#                  epsilon prediction, i.e. lerobot Diffusion Policy's objective.
+OBJECTIVE = "flow"
+N_DENOISING_STEPS = 10          # flow-matching Euler steps at inference
+DIFFUSION_TRAIN_STEPS = 100     # DDPM forward-process resolution
+DIFFUSION_INFER_STEPS = 100     # DDPM reverse steps at inference
 DATASET_ID = "lerobot/pusht"
 # DiT sized to ~47.5M (matching lerobot's DiT backbone): hidden 600, 6 layers, 8 heads
 N_HEADS = 8
@@ -398,6 +405,15 @@ class AdaLNBlock(nn.Module):
         return x
 
 
+def cosine_beta_schedule(num_steps, s=0.008):
+    """squaredcos_cap_v2 schedule (Nichol & Dhariwal), as used by lerobot's DDPM."""
+    steps = torch.arange(num_steps + 1, dtype=torch.float64)
+    f = torch.cos(((steps / num_steps) + s) / (1 + s) * math.pi / 2) ** 2
+    alphas_cumprod = f / f[0]
+    betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return betas.clamp(max=0.999).float()
+
+
 class DiTPolicy(nn.Module):
     def __init__(
         self,
@@ -406,9 +422,13 @@ class DiTPolicy(nn.Module):
         n_layers=N_LAYERS,
         prediction_horizon=PREDICTION_HORIZON,
         obs_horizon=OBS_HORIZON,
+        objective=OBJECTIVE,
+        diffusion_train_steps=DIFFUSION_TRAIN_STEPS,
     ):
         super().__init__()
         self.obs_horizon = obs_horizon
+        self.objective = objective
+        self.diffusion_train_steps = diffusion_train_steps
         # conditioning = obs_horizon*(image + state) + timestep, all hidden_dim
         # wide. The per-frame image/state features are flattened across time and
         # concatenated with the timestep embedding into one global cond vector.
@@ -436,6 +456,14 @@ class DiTPolicy(nn.Module):
             ]
         )
 
+        # DDPM schedule buffers (only used when objective == "diffusion"). Kept as
+        # buffers so they follow .to(device) and get copied into the EMA clone.
+        if objective == "diffusion":
+            betas = cosine_beta_schedule(diffusion_train_steps)
+            alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
+            self.register_buffer("betas", betas)
+            self.register_buffer("alphas_cumprod", alphas_cumprod)
+
     def forward(self, x_t, t, images, obs):
         # pure network: noisy actions + time + context -> predicted velocity
         # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
@@ -458,6 +486,9 @@ class DiTPolicy(nn.Module):
 
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
+        if self.objective == "diffusion":
+            return self._ddpm_sample(images, obs)
+
         batch_size = images.shape[0]
         x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF).to(images.device)
 
@@ -466,7 +497,34 @@ class DiTPolicy(nn.Module):
             t = torch.full((batch_size,), i / n_steps).to(images.device)
             v = self.forward(x, t, images, obs)
             x = x + v * dt
-        return x.clamp(-1.0, 1.0) 
+        return x.clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def _ddpm_sample(self, images, obs):
+        # Ancestral DDPM sampling with clip_sample (matches lerobot). Runs the
+        # full forward-process resolution in reverse (diffusion_train_steps).
+        device = images.device
+        batch_size = images.shape[0]
+        x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF, device=device)
+        betas, acp = self.betas, self.alphas_cumprod
+        alphas = 1.0 - betas
+        for t in range(self.diffusion_train_steps - 1, -1, -1):
+            t_batch = torch.full((batch_size,), float(t), device=device)
+            eps = self.forward(x, t_batch, images, obs)
+            acp_t = acp[t]
+            acp_prev = acp[t - 1] if t > 0 else torch.ones_like(acp_t)
+            # predict x0 from eps, clip to the normalized action range
+            x0 = (x - (1.0 - acp_t).sqrt() * eps) / acp_t.sqrt()
+            x0 = x0.clamp(-1.0, 1.0)
+            coef_x0 = (acp_prev.sqrt() * betas[t]) / (1.0 - acp_t)
+            coef_xt = (alphas[t].sqrt() * (1.0 - acp_prev)) / (1.0 - acp_t)
+            mean = coef_x0 * x0 + coef_xt * x
+            if t > 0:
+                var = betas[t] * (1.0 - acp_prev) / (1.0 - acp_t)
+                x = mean + var.sqrt() * torch.randn_like(x)
+            else:
+                x = mean
+        return x.clamp(-1.0, 1.0)
 
 
 # =============================================================================
@@ -513,6 +571,21 @@ def flow_matching_loss(policy, images, obs, actions, masks):
     return (loss * masks).sum() / masks.sum().clamp(min=1)
 
 
+def diffusion_loss(policy, images, obs, actions, masks, alphas_cumprod, num_train_steps):
+    # DDPM epsilon-prediction loss. Same masked-mean reduction as the flow loss.
+    B = actions.shape[0]
+    actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+    masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+
+    t_int = torch.randint(0, num_train_steps, (B,), device=actions.device)
+    noise = torch.randn_like(actions)
+    acp = alphas_cumprod[t_int][:, None, None]
+    x_t = acp.sqrt() * actions + (1.0 - acp).sqrt() * noise
+    eps_pred = policy(x_t, t_int.float(), images, obs)
+    loss = nn.functional.mse_loss(eps_pred, noise, reduction="none")
+    return (loss * masks).sum() / masks.sum().clamp(min=1)
+
+
 def train(
     policy,
     dataloader,
@@ -554,6 +627,12 @@ def train(
     # The model we hand to evaluate(): EMA copy when enabled, else the live one.
     eval_policy = ema_policy if ema_policy is not None else policy
 
+    # Objective-specific bits: DDPM needs the alphas_cumprod buffer (kept on the
+    # uncompiled module) for the forward noising; eval step count differs too.
+    orig = policy._orig_mod if hasattr(policy, "_orig_mod") else policy
+    alphas_cumprod = orig.alphas_cumprod if OBJECTIVE == "diffusion" else None
+    eval_n_steps = DIFFUSION_INFER_STEPS if OBJECTIVE == "diffusion" else N_DENOISING_STEPS
+
     last_loss = 0.0
     global_step = 0
     dataloader_iter = iter(dataloader)
@@ -580,7 +659,13 @@ def train(
         t_compute_start = time.perf_counter()
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = flow_matching_loss(policy, images, obs, actions, mask)
+            if OBJECTIVE == "diffusion":
+                loss = diffusion_loss(
+                    policy, images, obs, actions, mask,
+                    alphas_cumprod, DIFFUSION_TRAIN_STEPS,
+                )
+            else:
+                loss = flow_matching_loss(policy, images, obs, actions, mask)
         optimizer.zero_grad()
         loss.backward()
         # nanoGPT-style: clip_grad_norm_ returns the total grad norm pre-clip.
@@ -637,7 +722,7 @@ def train(
         if global_step % eval_every == 0:
             log_dict.update(evaluate(
                 eval_policy, device, n_episodes=EVAL_EPISODES, render=False,
-                n_steps=N_DENOISING_STEPS,
+                n_steps=eval_n_steps,
             ))
 
         if log_dict:
@@ -653,7 +738,7 @@ def train(
     if total_steps % eval_every != 0:
         final_dict.update(evaluate(
             eval_policy, device, n_episodes=EVAL_EPISODES, render=False,
-            n_steps=N_DENOISING_STEPS,
+            n_steps=eval_n_steps,
         ))
     if final_dict:
         wandb.log(final_dict, step=global_step)
@@ -707,6 +792,9 @@ def main():
             "num_keypoints": NUM_KEYPOINTS,
             "robot_dof": ROBOT_DOF,
             "obs_horizon": OBS_HORIZON,
+            "objective": OBJECTIVE,
+            "diffusion_train_steps": DIFFUSION_TRAIN_STEPS,
+            "diffusion_infer_steps": DIFFUSION_INFER_STEPS,
             "prediction_horizon": PREDICTION_HORIZON,
             "action_chunk_size": ACTION_CHUNK_SIZE,
             "n_denoising_steps": N_DENOISING_STEPS,
