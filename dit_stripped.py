@@ -28,13 +28,16 @@ N_ACTIONS = 16
 N_ACTION_STEPS = 8
 HIDDEN_DIM = 512
 BATCH_SIZE = 64
-TOTAL_STEPS = 50_000
+TOTAL_STEPS = 100_000
 LR = 1e-4
+LR_MIN = 1e-6
+WARMUP_STEPS = 500
 LOG_EVERY = 200
 EVAL_EVERY = 5_000
 SAVE_EVERY = 5_000
 EVAL_EPISODES=50
-CHECKPOINT_DIR = "checkpoints_dit"
+RUN_NAME = f"dit-pusht-slim-DINO-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+CHECKPOINT_DIR = f"checkpoints_dit-{RUN_NAME}"
 DATASET_ID = "lerobot/pusht"
 COORD_MIN, COORD_MAX = 0.0, 512.0
 # DINOv3 ViT-S/16: patch_size=16, embed_dim=384.
@@ -364,7 +367,6 @@ class _DiTNoiseNet(nn.Module):
         dropout=0.1,
         dim_feedforward=2048,
         nhead=8,
-        activation="gelu",
     ):
         super().__init__()
 
@@ -494,9 +496,8 @@ class FlowMatchingTransformerAgent(nn.Module):
         noise_acs = (1 - timestep[:, None, None]) * noise + timestep[:, None, None] * actions
         _, v_pred = self.noise_net(noise_acs, timestep, s_t)
 
-        loss = nn.functional.mse_loss(v_pred, actions-noise)
-        loss = (loss * mask).sum(1)  # mask the loss to only consider "real" acs
-        return loss.mean()
+        loss = nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
+        return (loss * mask).sum() / mask.sum().clamp(min=1)
 
     @torch.no_grad()
     def get_actions(self, imgs, obs, n_steps=10):
@@ -554,66 +555,97 @@ def evaluate(agent, device, n_episodes=EVAL_EPISODES, n_steps=10):
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 def train(agent, loader):
-    device = torch.device(
-        "mps"
-        if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    print(f"Training on {device}")
+    device = torch.device("cuda")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
     agent = agent.to(device)
-    optimizer = torch.optim.AdamW(agent.parameters(), lr=LR, weight_decay=1e-4)
+
+    ema_agent = copy.deepcopy(agent)
+    ema_agent.eval()
+
+    agent = torch.compile(agent)
+
+    src = agent._orig_mod if hasattr(agent, "_orig_mod") else agent
+    trainable = [p for p in src.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=LR, weight_decay=1e-4)
+
+    def lr_lambda(step):
+        if step < WARMUP_STEPS:
+            return (step + 1) / WARMUP_STEPS
+        progress = (step - WARMUP_STEPS) / max(1, TOTAL_STEPS - WARMUP_STEPS)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return LR_MIN / LR + (1.0 - LR_MIN / LR) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    step = 0
     running_loss, running_n = 0.0, 0
     pbar = tqdm(total=TOTAL_STEPS, desc="train")
+    dataloader_iter = iter(loader)
 
-    while step < TOTAL_STEPS:
-        for imgs, obs, ac_flat, mask_flat in loader:
-            imgs = imgs.to(device)
-            obs = obs.to(device)
-            ac_flat = ac_flat.to(device)
-            mask_flat = mask_flat.to(device)
+    for step in range(1, TOTAL_STEPS + 1):
+        try:
+            imgs, obs, ac_flat, mask_flat = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(loader)
+            imgs, obs, ac_flat, mask_flat = next(dataloader_iter)
 
+        imgs, obs, ac_flat, mask_flat = [
+            t.to(device, non_blocking=True) for t in (imgs, obs, ac_flat, mask_flat)
+        ]
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = agent(imgs, obs, ac_flat, mask_flat)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
 
-            step += 1
-            running_loss += loss.item()
-            running_n += 1
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+        # EMA: warm-ramp decay, copy buffers (e.g. BatchNorm running stats) directly
+        ema_decay = min(1 - (1 + step) ** (-0.75), 0.9999)
+        with torch.no_grad():
+            for ema_p, p in zip(ema_agent.parameters(), src.parameters()):
+                ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+            for ema_buf, buf in zip(ema_agent.buffers(), src.buffers()):
+                ema_buf.data.copy_(buf.data)
 
-            log = {}
-            if step % LOG_EVERY == 0:
-                log["train/loss"] = running_loss / running_n
-                running_loss, running_n = 0.0, 0
+        running_loss += loss.item()
+        running_n += 1
+        pbar.update(1)
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            if step % EVAL_EVERY == 0:
-                for n in [1, 5, 10]:
-                    sr = evaluate(agent, device, n_episodes=20, n_steps=n)
-                    log[f"eval/success_n{n}"] = sr
-                    print(f"step {step}: n_steps={n}  success={sr:.2f}")
+        log = {}
+        if step % LOG_EVERY == 0:
+            log["train/loss"] = running_loss / running_n
+            log["lr"] = scheduler.get_last_lr()[0]
+            running_loss, running_n = 0.0, 0
 
-            if log:
-                wandb.log(log, step=step)
+        if step % EVAL_EVERY == 0:
+            sr = evaluate(ema_agent, device, n_episodes=EVAL_EPISODES, n_steps=10)
+            ema_agent.eval()  # evaluate() calls agent.train() at end; undo that
+            log["success_rate"] = sr
+            print(f"step {step}: success={sr:.2f}")
 
-            if step % SAVE_EVERY == 0:
-                ckpt = os.path.join(CHECKPOINT_DIR, f"step_{step}.pt")
-                torch.save(
-                    {
-                        "step": step,
-                        "model": agent.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                    },
-                    ckpt,
-                )
-                print(f"Saved {ckpt}")
+        if log:
+            wandb.log(log, step=step)
 
-            if step >= TOTAL_STEPS:
-                break
+        if step % SAVE_EVERY == 0:
+            model = agent._orig_mod if hasattr(agent, "_orig_mod") else agent
+            ckpt = os.path.join(CHECKPOINT_DIR, f"step_{step}.pt")
+            torch.save(
+                {
+                    "step": step,
+                    "model": model.state_dict(),
+                    "ema_model": ema_agent.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                },
+                ckpt,
+            )
+            print(f"Saved {ckpt}")
 
     pbar.close()
 
@@ -623,7 +655,7 @@ def main():
     wandb.init(
         project="pushT-slim",
         entity="robot_learning_collective",
-        name=f"dit-pusht-slim-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}",
+        name=RUN_NAME,
         config=dict(
             total_steps=TOTAL_STEPS,
             lr=LR,
@@ -647,7 +679,6 @@ def main():
             dim_feedforward=HIDDEN_DIM * 4,
             nhead=8,
             dropout=0.1,
-            activation="gelu",
         ),
     )
     dataset = PushTDataset()
@@ -655,8 +686,10 @@ def main():
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=0,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
     print(
         f"Steps/epoch: {len(loader)},  ~{math.ceil(TOTAL_STEPS / len(loader))} epochs"
