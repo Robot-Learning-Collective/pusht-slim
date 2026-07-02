@@ -37,7 +37,7 @@ LOG_EVERY = 200
 EVAL_EVERY = 5_000
 EVAL_EPISODES = 20
 SAVE_EVERY = 25_000
-RUN_NAME = f"ema-cosine_lr-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"ema-cosine_lr-beta_ts-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -454,7 +454,7 @@ def flow_matching_loss(policy, images, obs, actions, masks):
     actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
     masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
 
-    t = torch.rand(B, device=actions.device)
+    t = torch.distributions.Beta(1.5, 1.0).sample((B,)).to(actions.device)
     noise = torch.randn_like(actions)
     x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
     v_pred = policy(x_t, t, images, obs)
@@ -645,6 +645,7 @@ def main():
             "lr": LR,
             "lr_min": LR_MIN,
             "warmup_steps": WARMUP_STEPS,
+            "timestep_dist": "beta(1.5,1.0)",
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
