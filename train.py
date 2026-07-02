@@ -35,9 +35,9 @@ WARMUP_STEPS = 500   # linear LR warmup
 LR_MIN = 1e-6        # cosine decay floor
 LOG_EVERY = 200
 EVAL_EVERY = 5_000
-EVAL_EPISODES = 20
+EVAL_EPISODES = 50
 SAVE_EVERY = 25_000
-RUN_NAME = f"ema-cosine_lr-beta_ts-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"ema-cosine_lr-enc_lr-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -454,7 +454,7 @@ def flow_matching_loss(policy, images, obs, actions, masks):
     actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
     masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
 
-    t = torch.distributions.Beta(1.5, 1.0).sample((B,)).to(actions.device)
+    t = torch.rand(B, device=actions.device)
     noise = torch.randn_like(actions)
     x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
     v_pred = policy(x_t, t, images, obs)
@@ -489,7 +489,16 @@ def train(
 
     policy = torch.compile(policy)
 
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
+    # Split params: ResNet backbone gets 10% of the DiT learning rate so the
+    # pretrained visual features aren't clobbered while the DiT head trains freely.
+    src = policy._orig_mod if hasattr(policy, "_orig_mod") else policy
+    backbone_params = list(src.image_encoder.backbone.parameters())
+    backbone_ids = {id(p) for p in backbone_params}
+    other_params = [p for p in src.parameters() if id(p) not in backbone_ids]
+    optimizer = torch.optim.AdamW([
+        {"params": other_params,    "lr": lr},
+        {"params": backbone_params, "lr": lr * 0.1},
+    ], weight_decay=1e-4)
 
     def lr_lambda(step):
         if step < WARMUP_STEPS:
@@ -645,7 +654,7 @@ def main():
             "lr": LR,
             "lr_min": LR_MIN,
             "warmup_steps": WARMUP_STEPS,
-            "timestep_dist": "beta(1.5,1.0)",
+            "timestep_dist": "uniform",
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
