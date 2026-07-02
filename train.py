@@ -10,8 +10,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import torchvision.models as models
 import torchvision.transforms as T
+from transformers import AutoModel
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
 import gym_pusht  
@@ -37,7 +37,7 @@ LOG_EVERY = 200
 EVAL_EVERY = 5_000
 EVAL_EPISODES = 50
 SAVE_EVERY = 25_000
-RUN_NAME = f"ema-cosine_lr-enc_lr-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"ema-cosine_lr-dinov3-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -56,10 +56,10 @@ COORD_MIN, COORD_MAX = 0.0, 512.0
 # PushT frames are 96x96. lerobot-style: crop at native resolution (no upsample)
 # and let SpatialSoftmax pool the small feature map (see ImageEncoder).
 NATIVE_IMG_SIZE = 96
-CROP_SIZE = 84  # random crop (train) / center crop (eval), ~0.875 of native
-NUM_KEYPOINTS = 32  # SpatialSoftmax keypoints
-IMG_MEAN = [0.485, 0.456, 0.406]
-IMG_STD = [0.229, 0.224, 0.225]
+CROP_SIZE = 80   # must be divisible by DINOv3 patch size (16); 80/16=5 patches/side
+DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"  # ViT-S/16, embed_dim=384
+DINOV3_EMBED_DIM = 384
+
 
 def normalize(x):
     return 2.0 * (x - COORD_MIN) / (COORD_MAX - COORD_MIN) - 1.0
@@ -188,89 +188,36 @@ class PushTDataset(Dataset):
 # =============================================================================
 # 3. Model
 # =============================================================================
-class SpatialSoftmax(nn.Module):
-    """Spatial soft-argmax pooling (Finn et al. 2015), ported from lerobot/robomimic.
-
-    Turns a (B, C, H, W) feature map into (B, K, 2) keypoint coordinates: the
-    softmax-weighted "center of mass" of each channel's activations. Unlike global
-    average pooling, this preserves *where* features fire, so it stays informative
-    even on the tiny feature maps a stock ResNet produces from small inputs (an
-    84x84 crop -> 512x3x3). A 1x1 conv first remaps C -> num_kp keypoint channels.
-    """
-
-    def __init__(self, input_shape, num_kp=None):
-        super().__init__()
-        self._in_c, self._in_h, self._in_w = input_shape
-        if num_kp is not None:
-            self.nets = nn.Conv2d(self._in_c, num_kp, kernel_size=1)
-            self._out_c = num_kp
-        else:
-            self.nets = None
-            self._out_c = self._in_c
-
-        pos_x, pos_y = np.meshgrid(
-            np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h)
-        )
-        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
-        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
-        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
-
-    def forward(self, features):
-        if self.nets is not None:
-            features = self.nets(features)
-        batch = features.shape[0]
-        features = features.reshape(-1, self._in_h * self._in_w)
-        attention = F.softmax(features, dim=-1)
-        keypoints = attention @ self.pos_grid  # (B * out_c, 2)
-        return keypoints.reshape(batch, self._out_c, 2)
-
-
 class ImageEncoder(nn.Module):
-    """lerobot/Diffusion-Policy-style vision encoder.
+    """DINOv3 ViT-S/16 image encoder.
 
-    Solves the "small image + ResNet built for 224" problem the way lerobot does:
-    keep the stock ResNet stem, feed a native-resolution crop (no upsampling), and
-    let SpatialSoftmax pool the resulting tiny feature map into keypoints — instead
-    of preserving resolution via a modified stem or upsampling the input to 224.
-    Cropping lives here (random in train, center in eval) so train and eval share
-    a single code path.
+    Uses the frozen DINOv3 CLS token as a global image embedding. The backbone
+    is kept frozen because the PushT dataset (~206 episodes) is too small to
+    fine-tune a ViT without destroying its pretrained features. Only the
+    projection head (fc) is trained.
+
+    Input must be divisible by patch size 16; we crop 96x96 → 80x80
+    (80/16 = 5 patches/side = 25 patch tokens + 1 CLS token).
     """
 
-    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
+    def __init__(self, out_dim, crop_size=CROP_SIZE):
         super().__init__()
-        weights = models.ResNet34_Weights.DEFAULT
-        resnet = models.resnet34(weights=weights)
+        self.backbone = AutoModel.from_pretrained(DINOV3_MODEL)
+        self.backbone.requires_grad_(False)
 
-        # Reuse the exact normalization the pretrained weights expect, sourced
-        # from the weights metadata so it can't drift out of sync.
-        preprocess = weights.transforms()
+        # DINOv3 uses ImageNet normalization
         self.register_buffer(
-            "img_mean", torch.tensor(preprocess.mean).view(1, 3, 1, 1)
+            "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         )
         self.register_buffer(
-            "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
+            "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
-        # Same crop window for the whole batch (matching lerobot's RandomCrop).
-        # We index with tensors instead of torchvision's RandomCrop because the
-        # latter calls torch.randint(...).item(), and that .item() forces a
-        # CUDA sync + a torch.compile graph break at the top of the model.
         self.crop_size = crop_size
         self.center_crop = T.CenterCrop(crop_size)
-
-        # Drop avgpool + fc; keep the stock stem and conv stages -> feature map.
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
-
-        # Dry run to get the feature-map shape that SpatialSoftmax must index.
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, crop_size, crop_size)
-            feat_shape = self.backbone(dummy).shape[1:]  # (C, H, W)
-        self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
-        self.fc = nn.Linear(num_kp * 2, out_dim)
+        self.fc = nn.Linear(DINOV3_EMBED_DIM, out_dim)
 
     def random_crop(self, images):
-        # One random crop window for the whole batch, expressed entirely in
-        # tensor ops (no .item()) so it stays inside the compiled graph.
         _, _, h, w = images.shape
         size = self.crop_size
         top = torch.randint(0, h - size + 1, (1,), device=images.device)
@@ -283,10 +230,9 @@ class ImageEncoder(nn.Module):
         # images: (batch, 3, 96, 96) in [0, 1]
         images = self.random_crop(images) if self.training else self.center_crop(images)
         images = (images - self.img_mean) / self.img_std
-
-        x = self.backbone(images)
-        x = self.pool(x).flatten(1)  # (batch, num_kp * 2)
-        return self.fc(x)
+        # pooler_output is the CLS token: (batch, DINOV3_EMBED_DIM)
+        features = self.backbone(pixel_values=images).pooler_output
+        return self.fc(features)
 
 
 class StateEncoder(nn.Module):
@@ -489,16 +435,10 @@ def train(
 
     policy = torch.compile(policy)
 
-    # Split params: ResNet backbone gets 10% of the DiT learning rate so the
-    # pretrained visual features aren't clobbered while the DiT head trains freely.
+    # DINOv3 backbone is frozen; only train the projection head + DiT.
     src = policy._orig_mod if hasattr(policy, "_orig_mod") else policy
-    backbone_params = list(src.image_encoder.backbone.parameters())
-    backbone_ids = {id(p) for p in backbone_params}
-    other_params = [p for p in src.parameters() if id(p) not in backbone_ids]
-    optimizer = torch.optim.AdamW([
-        {"params": other_params,    "lr": lr},
-        {"params": backbone_params, "lr": lr * 0.1},
-    ], weight_decay=1e-4)
+    trainable = [p for p in src.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
 
     def lr_lambda(step):
         if step < WARMUP_STEPS:
@@ -658,10 +598,9 @@ def main():
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
-            "backbone": "resnet34",
-            "pooling": "spatial_softmax",
+            "backbone": DINOV3_MODEL,
+            "backbone_frozen": True,
             "crop_size": CROP_SIZE,
-            "num_keypoints": NUM_KEYPOINTS,
             "robot_dof": ROBOT_DOF,
             "prediction_horizon": PREDICTION_HORIZON,
             "action_chunk_size": ACTION_CHUNK_SIZE,
