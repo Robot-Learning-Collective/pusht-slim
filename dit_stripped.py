@@ -17,28 +17,31 @@ from torch.utils.data import Dataset, DataLoader
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as T
 import torchvision.transforms.functional as TF
-from torchvision import models
+from transformers import AutoModel
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 N_ACTIONS = 16
 N_ACTION_STEPS = 8
-HIDDEN_DIM = 512 
+HIDDEN_DIM = 512
 BATCH_SIZE = 64
-TOTAL_STEPS = 200_000
+TOTAL_STEPS = 50_000
 LR = 1e-4
 LOG_EVERY = 200
-EVAL_EVERY = 10_000
-SAVE_EVERY = 10_000
+EVAL_EVERY = 5_000
+SAVE_EVERY = 5_000
+EVAL_EPISODES=50
 CHECKPOINT_DIR = "checkpoints_dit"
 DATASET_ID = "lerobot/pusht"
-# ResNet.n_tokens is hardcoded to 49, assuming 224×224 → 7×7 spatial tokens
-IMG_SIZE = 224
 COORD_MIN, COORD_MAX = 0.0, 512.0
-IMG_MEAN = [0.485, 0.456, 0.406]
-IMG_STD = [0.229, 0.224, 0.225]
+# DINOv3 ViT-S/16: patch_size=16, embed_dim=384.
+# Crop must be divisible by 16; 80×80 → 5×5 = 25 patch tokens.
+CROP_SIZE = 80
+DINOV3_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
+DINOV3_EMBED_DIM = 384
 
 
 def normalize(x):
@@ -74,13 +77,7 @@ class PushTDataset(Dataset):
     def __getitem__(self, idx):
         current_episode = self.episode_indices[idx]
 
-        img = TF.resize(
-            self.cache[idx]["observation.image"],
-            [IMG_SIZE, IMG_SIZE],
-            antialias=True,
-        )
-        img = TF.normalize(img, IMG_MEAN, IMG_STD)
-
+        img = self.cache[idx]["observation.image"]  # (3, 96, 96) in [0, 1]
         obs = normalize(self.cache[idx]["observation.state"])
 
         actions = torch.zeros(self.n_actions, 2)
@@ -96,55 +93,55 @@ class PushTDataset(Dataset):
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
-def _construct_resnet(size, norm, weights=None):
-    if size == 18:
-        w = models.ResNet18_Weights
-        m = models.resnet18(norm_layer=norm)
-    elif size == 34:
-        w = models.ResNet34_Weights
-        m = models.resnet34(norm_layer=norm)
-    else:
-        raise NotImplementedError(f"Missing size: {size}")
+class DINOv3Encoder(nn.Module):
+    """Frozen DINOv3 ViT-S/16 returning spatial patch tokens.
 
-    if weights is not None:
-        w = w.verify(weights).get_state_dict(progress=True)
-        m.load_state_dict(w)
-    return m
+    Replaces ResNet(avg_pool=False) which gave 49 tokens from a 7×7 conv map.
+    DINOv3 on an 80×80 crop gives 25 patch tokens (5×5) of shape
+    (B, 25, HIDDEN_DIM) after a linear projection from the 384-dim ViT embedding.
+    The backbone is frozen — the dataset is too small to fine-tune a ViT safely.
+    """
 
-
-class ResNet(nn.Module):
-    def __init__(
-        self,
-        size,
-        weights=None,
-        avg_pool=True,
-    ):
+    def __init__(self, out_dim, crop_size=CROP_SIZE):
         super().__init__()
-        norm_layer = nn.BatchNorm2d
-        model = _construct_resnet(size, norm_layer, weights)
-        model.fc = nn.Identity()
-        if not avg_pool:
-            model.avgpool = nn.Identity()
-        self.model = model
-        self._size, self._avg_pool = size, avg_pool
+        self.backbone = AutoModel.from_pretrained(DINOV3_MODEL)
+        self.backbone.requires_grad_(False)
 
-    def forward(self, x):
-        if self._avg_pool:
-            return self.model(x)[:, None]
-        B = x.shape[0]
-        x = self.model(x)
-        x = x.reshape((B, self.embed_dim, -1))
-        return x.transpose(1, 2)
+        self.register_buffer(
+            "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+
+        self.crop_size = crop_size
+        self.center_crop = T.CenterCrop(crop_size)
+        self._n_patches = (crop_size // 16) ** 2  # 25 for 80×80
+        self.proj = nn.Linear(DINOV3_EMBED_DIM, out_dim)
+
+    def random_crop(self, images):
+        _, _, h, w = images.shape
+        size = self.crop_size
+        top = torch.randint(0, h - size + 1, (1,), device=images.device)
+        left = torch.randint(0, w - size + 1, (1,), device=images.device)
+        rows = top + torch.arange(size, device=images.device)
+        cols = left + torch.arange(size, device=images.device)
+        return images[:, :, rows[:, None], cols[None, :]]
+
+    def forward(self, images):
+        images = self.random_crop(images) if self.training else self.center_crop(images)
+        images = (images - self.img_mean) / self.img_std
+        # last_hidden_state: (B, 1 + n_patches, 384) — index 0 is CLS, rest are patches
+        patch_tokens = self.backbone(pixel_values=images).last_hidden_state[:, 1:]
+        return self.proj(patch_tokens)  # (B, n_patches, out_dim)
 
     @property
     def embed_dim(self):
-        return {18: 512, 34: 512, 50: 2048}[self._size]
+        return self.proj.out_features
 
     @property
     def n_tokens(self):
-        if self._avg_pool:
-            return 1
-        return 49
+        return self._n_patches
 
 class _PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -517,7 +514,7 @@ class FlowMatchingTransformerAgent(nn.Module):
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def evaluate(agent, device, n_episodes=10, n_steps=10):
+def evaluate(agent, device, n_episodes=EVAL_EPISODES, n_steps=10):
     env = gym.make(
         "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode="rgb_array"
     )
@@ -531,10 +528,7 @@ def evaluate(agent, device, n_episodes=10, n_steps=10):
         state_t = normalize(torch.from_numpy(obs_env["agent_pos"]).float())
 
         while not done:
-            img_in = TF.normalize(
-                TF.resize(img_t, [IMG_SIZE, IMG_SIZE]), IMG_MEAN, IMG_STD
-            )
-            imgs = img_in.unsqueeze(0).to(device)
+            imgs = img_t.unsqueeze(0).to(device)  # encoder owns crop + normalize
             obs = state_t.unsqueeze(0).to(device)
 
             acs = agent.get_actions(imgs, obs, n_steps=n_steps)  # (1, 16, 2) normalized
@@ -575,7 +569,7 @@ def train(agent, loader):
     pbar = tqdm(total=TOTAL_STEPS, desc="train")
 
     while step < TOTAL_STEPS:
-        for imgs, obs, ac_flat in loader:
+        for imgs, obs, ac_flat, mask_flat in loader:
             imgs = imgs.to(device)
             obs = obs.to(device)
             ac_flat = ac_flat.to(device)
@@ -638,14 +632,10 @@ def main():
             batch_size=BATCH_SIZE,
         ),
     )
-    resnet = ResNet(
-        size=34,
-        weights="IMAGENET1K_V1",
-        avg_pool=False,  # keep 7×7 = 49 spatial tokens per image
-    )
+    image_encoder = DINOv3Encoder(out_dim=HIDDEN_DIM)
 
     agent = FlowMatchingTransformerAgent(
-        image_encoder=resnet,
+        image_encoder=image_encoder,
         odim=2,  
         ac_dim=2,
         ac_chunk=N_ACTIONS,
