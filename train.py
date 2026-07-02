@@ -19,6 +19,10 @@ import gym_pusht
 ROBOT_DOF = 2
 PREDICTION_HORIZON = 16
 ACTION_CHUNK_SIZE = 8
+# Observation history fed to the policy. 1 = single frame (original). 2 gives the
+# policy velocity/temporal context and matches lerobot's Diffusion Policy default;
+# the extra frames are flattened into the global conditioning vector.
+OBS_HORIZON = 2
 N_DENOISING_STEPS = 10
 DATASET_ID = "lerobot/pusht"
 # DiT sized to ~47.5M (matching lerobot's DiT backbone): hidden 600, 6 layers, 8 heads
@@ -81,16 +85,35 @@ class PushTAdapter:
     sees model-ready tensors going in and env-ready actions coming out.
     """
 
-    def __init__(self, device):
+    def __init__(self, device, obs_horizon=OBS_HORIZON):
         self.device = device
+        self.obs_horizon = obs_horizon
+        self._img_hist = None
+        self._state_hist = None
 
-    def observe(self, obs):
-        # env obs dict -> batched, normalized (images, states) on device.
-        # Feed the raw native-resolution frame; the encoder owns cropping (center
-        # crop in eval, random crop in train) so train and eval share one path.
+    def _parse(self, obs):
         image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1).float() / 255.0
         state = normalize(torch.from_numpy(obs["agent_pos"]).float())
-        return image.unsqueeze(0).to(self.device), state.unsqueeze(0).to(self.device)
+        return image, state
+
+    def reset(self, obs):
+        # Prime the history with the first frame repeated, so the very first
+        # decision sees a full obs_horizon stack (no velocity yet, as expected).
+        image, state = self._parse(obs)
+        self._img_hist = [image] * self.obs_horizon
+        self._state_hist = [state] * self.obs_horizon
+
+    def observe(self, obs):
+        # env obs dict -> batched, normalized (images, states) on device, each
+        # carrying the last obs_horizon frames stacked on a time axis.
+        # Feed the raw native-resolution frame; the encoder owns cropping (center
+        # crop in eval, random crop in train) so train and eval share one path.
+        image, state = self._parse(obs)
+        self._img_hist = (self._img_hist + [image])[-self.obs_horizon :]
+        self._state_hist = (self._state_hist + [state])[-self.obs_horizon :]
+        images = torch.stack(self._img_hist, dim=0)  # (T, 3, 96, 96)
+        states = torch.stack(self._state_hist, dim=0)  # (T, 2)
+        return images.unsqueeze(0).to(self.device), states.unsqueeze(0).to(self.device)
 
     def act(self, actions):
         # policy output in [-1, 1] -> env actions in [0, 512]
@@ -109,6 +132,7 @@ def evaluate(policy, device, n_episodes, render, n_steps):
     max_rewards = []
     for episode in range(n_episodes):
         obs, _ = env.reset()
+        adapter.reset(obs)
         done = False
         max_reward = -float("inf")
 
@@ -136,19 +160,26 @@ def evaluate(policy, device, n_episodes, render, n_steps):
 
     env.close()
     policy.train()
-    return {
+    metrics = {
         "success_rate": successes / n_episodes,
         "avg_max_reward": sum(max_rewards) / n_episodes,
     }
+    print(
+        f"[eval] success_rate={metrics['success_rate']:.3f} "
+        f"avg_max_reward={metrics['avg_max_reward']:.3f} (n_episodes={n_episodes}, "
+        f"n_steps={n_steps})"
+    )
+    return metrics
 
 
 # =============================================================================
 # 2. Dataset
 # =============================================================================
 class PushTDataset(Dataset):
-    def __init__(self, dataset_id, prediction_horizon):
+    def __init__(self, dataset_id, prediction_horizon, obs_horizon=OBS_HORIZON):
         self.dataset = LeRobotDataset(dataset_id)
         self.prediction_horizon = prediction_horizon
+        self.obs_horizon = obs_horizon
 
         # decode every frame once and keep it in RAM; afterwards each __getitem__
         print("Caching dataset in memory...")
@@ -169,11 +200,19 @@ class PushTDataset(Dataset):
     def __getitem__(self, idx):
         current_episode = self.episode_indices[idx]
 
-        # Return the raw native-resolution frame ([0, 1], 3x96x96). Cropping and
-        # normalization happen inside the encoder so train/eval stay in sync.
-        img = self.cache[idx]["observation.image"]
-
-        obs = normalize(self.cache[idx]["observation.state"])
+        # Return the last obs_horizon raw native-resolution frames ([0, 1],
+        # (H, 3, 96, 96)) stacked oldest->newest, clamped at the episode start
+        # (repeat the current frame). Cropping and normalization happen inside
+        # the encoder so train/eval stay in sync.
+        imgs, states = [], []
+        for offset in range(-(self.obs_horizon - 1), 1):
+            i = idx + offset
+            if i < 0 or self.episode_indices[i] != current_episode:
+                i = idx  # before episode start -> repeat current frame
+            imgs.append(self.cache[i]["observation.image"])
+            states.append(normalize(self.cache[i]["observation.state"]))
+        img = torch.stack(imgs, dim=0)  # (H, 3, 96, 96)
+        obs = torch.stack(states, dim=0)  # (H, 2)
 
         actions = torch.zeros(self.prediction_horizon, 2)
         mask = torch.zeros(self.prediction_horizon, 2)
@@ -366,9 +405,13 @@ class DiTPolicy(nn.Module):
         n_heads=N_HEADS,
         n_layers=N_LAYERS,
         prediction_horizon=PREDICTION_HORIZON,
+        obs_horizon=OBS_HORIZON,
     ):
         super().__init__()
-        # conditioning = image + state + timestep, all hidden_dim wide
+        self.obs_horizon = obs_horizon
+        # conditioning = obs_horizon*(image + state) + timestep, all hidden_dim
+        # wide. The per-frame image/state features are flattened across time and
+        # concatenated with the timestep embedding into one global cond vector.
         self.image_encoder = ImageEncoder(out_dim=hidden_dim)
         self.timestep_encoder = TimestepEncoder(out_dim=hidden_dim)
         self.state_encoder = StateEncoder(out_dim=hidden_dim)
@@ -381,7 +424,7 @@ class DiTPolicy(nn.Module):
         )
 
         self.cond_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim * 4),
+            nn.Linear(hidden_dim * (2 * obs_horizon + 1), hidden_dim * 4),
             nn.GELU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
@@ -396,9 +439,12 @@ class DiTPolicy(nn.Module):
     def forward(self, x_t, t, images, obs):
         # pure network: noisy actions + time + context -> predicted velocity
         # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
-        # images: (batch, 3, 96, 96), obs: (batch, ROBOT_DOF)
-        images_cond = self.image_encoder(images)
-        obs_cond = self.state_encoder(obs)
+        # images: (batch, obs_horizon, 3, 96, 96), obs: (batch, obs_horizon, DOF)
+        B, H = images.shape[0], images.shape[1]
+        images_cond = self.image_encoder(images.reshape(B * H, *images.shape[2:]))
+        images_cond = images_cond.reshape(B, -1)  # (B, H * hidden)
+        obs_cond = self.state_encoder(obs.reshape(B * H, obs.shape[-1]))
+        obs_cond = obs_cond.reshape(B, -1)  # (B, H * hidden)
         timestep_cond = self.timestep_encoder(t)
         cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
         cond = self.cond_proj(cond)
@@ -660,6 +706,7 @@ def main():
             "crop_size": CROP_SIZE,
             "num_keypoints": NUM_KEYPOINTS,
             "robot_dof": ROBOT_DOF,
+            "obs_horizon": OBS_HORIZON,
             "prediction_horizon": PREDICTION_HORIZON,
             "action_chunk_size": ACTION_CHUNK_SIZE,
             "n_denoising_steps": N_DENOISING_STEPS,
