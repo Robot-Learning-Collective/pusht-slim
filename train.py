@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 from datetime import datetime
@@ -30,11 +31,14 @@ LR = 1e-4
 # total pre-clip grad norm, which we log to watch for instability. Set to a
 # float (nanoGPT uses 1.0) to also clip; None measures the norm without clipping.
 GRAD_CLIP = None
+WARMUP_STEPS = 500   # linear LR warmup
+LR_MIN = 1e-6        # cosine decay floor
+USE_EMA = True       # evaluate an EMA copy of the weights (lerobot-style)
 LOG_EVERY = 200
-EVAL_EVERY = 5_000
-EVAL_EPISODES = 20
+EVAL_EVERY = 10_000
+EVAL_EPISODES = 50   # more episodes -> less noisy success_rate (was 20, +-0.11)
 SAVE_EVERY = 25_000
-RUN_NAME = f"pusht-dit-bs512-lr1e4-50k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = os.environ.get("RUN_NAME") or f"claude-baseline-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -422,7 +426,7 @@ class DiTPolicy(nn.Module):
 # =============================================================================
 # 4. Training
 # =============================================================================
-def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
+def save_checkpoint(policy, ema_policy, optimizer, scheduler, global_step, loss, checkpoint_dir):
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
 
     # torch.compile wraps the model and stores the real model in _orig_mod.
@@ -432,7 +436,9 @@ def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
         {
             "step": global_step,
             "model_state_dict": model.state_dict(),
+            "ema_model_state_dict": ema_policy.state_dict() if ema_policy is not None else None,
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "loss": loss,
         },
         checkpoint_path,
@@ -478,10 +484,29 @@ def train(
     torch.set_float32_matmul_precision("high")
 
     policy = policy.to(device)
+
+    # EMA copy evaluated in place of the live weights (lerobot-style). Kept
+    # uncompiled and updated by hand each step from the live (compiled) params.
+    ema_policy = copy.deepcopy(policy) if USE_EMA else None
+    if ema_policy is not None:
+        ema_policy.eval()
+
     policy = torch.compile(policy)
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
+
+    def lr_lambda(step):
+        if step < WARMUP_STEPS:
+            return (step + 1) / WARMUP_STEPS
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return LR_MIN / lr + (1.0 - LR_MIN / lr) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # The model we hand to evaluate(): EMA copy when enabled, else the live one.
+    eval_policy = ema_policy if ema_policy is not None else policy
 
     last_loss = 0.0
     global_step = 0
@@ -519,6 +544,19 @@ def train(
             max_norm=GRAD_CLIP if GRAD_CLIP is not None else float("inf"),
         )
         optimizer.step()
+        scheduler.step()
+
+        # EMA: warm-ramp decay (fast early, asymptotes to 0.9999 ~31k steps)
+        if ema_policy is not None:
+            ema_decay = min(1 - (1 + global_step) ** (-0.75), 0.9999)
+            src = policy._orig_mod if hasattr(policy, "_orig_mod") else policy
+            with torch.no_grad():
+                for ema_p, p in zip(ema_policy.parameters(), src.parameters()):
+                    ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+                # copy buffers (e.g. BN running stats) so the EMA model sees
+                # up-to-date normalization rather than its frozen init values.
+                for ema_b, b in zip(ema_policy.buffers(), src.buffers()):
+                    ema_b.data.copy_(b.data)
 
         last_loss = loss.item()
         t_step_end = time.perf_counter()
@@ -536,6 +574,7 @@ def train(
             it_per_s = 1e3 / step_ms if step_ms > 0 else 0.0
             grad_norm_val = grad_norm.item()
             log_dict["loss"] = last_loss
+            log_dict["lr"] = scheduler.get_last_lr()[0]
             log_dict["grad_norm"] = grad_norm_val
             log_dict["time/data_ms"] = data_ms
             log_dict["time/compute_ms"] = compute_ms
@@ -551,7 +590,7 @@ def train(
 
         if global_step % eval_every == 0:
             log_dict.update(evaluate(
-                policy, device, n_episodes=EVAL_EPISODES, render=False,
+                eval_policy, device, n_episodes=EVAL_EPISODES, render=False,
                 n_steps=N_DENOISING_STEPS,
             ))
 
@@ -560,20 +599,20 @@ def train(
 
         if global_step % save_every == 0:
             save_checkpoint(
-                policy, optimizer, global_step, last_loss, checkpoint_dir
+                policy, ema_policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir
             )
 
     # final eval + checkpoint, unless the last step already triggered them
     final_dict = {}
     if total_steps % eval_every != 0:
         final_dict.update(evaluate(
-            policy, device, n_episodes=EVAL_EPISODES, render=False,
+            eval_policy, device, n_episodes=EVAL_EPISODES, render=False,
             n_steps=N_DENOISING_STEPS,
         ))
     if final_dict:
         wandb.log(final_dict, step=global_step)
     if total_steps % save_every != 0:
-        save_checkpoint(policy, optimizer, global_step, last_loss, checkpoint_dir)
+        save_checkpoint(policy, ema_policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir)
 
 def main():
 
@@ -610,6 +649,9 @@ def main():
             "eval_episodes": EVAL_EPISODES,
             "save_every": SAVE_EVERY,
             "lr": LR,
+            "warmup_steps": WARMUP_STEPS,
+            "lr_min": LR_MIN,
+            "use_ema": USE_EMA,
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
