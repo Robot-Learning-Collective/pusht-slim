@@ -59,5 +59,30 @@ obs=1 runs (B0, E2) were unaffected.
 
 _(updated as runs finish)_
 
+## Analysis — what the plateau actually is
+gym_pusht: `reward = clip(coverage/0.95, 0, 1)` and `terminated = is_success = coverage > 0.95`
+(pusht.py:257-258). So the episode **ends the moment coverage exceeds 95%**, and
+`max_reward == 1.0 ⟺ success`. Therefore AMR ≈ 0.96 with SR ≈ 0.54 means: ~half the episodes
+reach 1.0 (success), the other half **stall just below 95% coverage** and never close the last
+few percent. This is a genuine **final-precision** gap (can't nudge coverage 0.90→0.95), not
+drift away from a reached goal.
+
+Evidence on *which* lever matters:
+- Objective (flow vs DDPM), obs horizon (1 vs 2), and 200k-vs-50k steps all land at ~0.5 SR.
+- **E2 (DDPM, 100 denoising steps) also plateaus at 0.54** → denoising/inference precision is
+  NOT the bottleneck.
+- Both known ~80% references differ from us most in the **vision encoder**: lerobot DP uses
+  ResNet18 + **GroupNorm, trained from scratch**; we use ResNet34 + **BatchNorm + ImageNet
+  pretrained**. BatchNorm's train/eval running-stat mismatch and ImageNet features on synthetic
+  PushT frames are the prime remaining suspects for the missing final precision.
+
 ## Conclusions
-_(pending)_
+_(pending E3/E4/E5/E6; preliminary: the ~0.5 SR plateau is a last-5%-coverage precision gap that
+obs-horizon, objective, and denoising steps do not fix — vision encoder (GroupNorm+from-scratch)
+and closed-loop cadence are the top untested levers.)_
+
+## Recommended next experiments (if this direction continues)
+1. **Vision encoder = ResNet18 + GroupNorm, trained from scratch** (lerobot DP's exact choice) —
+   highest-value untested lever for the final-precision gap.
+2. **Smaller action chunk at eval** (replan every 1–4 steps) — cheap closed-loop test (see E6).
+3. **Temporal action ensembling** (ManiFlow tip) for smoother final settling.
