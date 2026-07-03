@@ -51,7 +51,7 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 | E4 | E4-big200m-flow | 9tr0zfle | obs2, flow, 221M, 25k | 0.60 | 0.60 | 0.905 | 12.5k 0.52/0.878 → 25k **0.60**/0.905. **Best SR so far**; 200M lifted SR above the plateau even at only 25k steps (vs 50k elsewhere) |
 | E7 | E7-resnet18-gn-scratch | (queued) | resnet18+GN+scratch, obs2, flow, 40k | – | – | – | orig-DP encoder (user); queued after E4 |
 | E7 | E7-resnet18-gn-scratch | lud9v5p0 | resnet18+GN+scratch, obs2, flow, 40k | **0.60** | 0.50 | **0.931** | 20k 0.60/0.931 → 40k 0.50/0.877. **Peaks ~20k then overfits/degrades** (from-scratch encoder, tiny data). Best flow AMR + ties best SR → BN+ImageNet-pretrained resnet34 was genuinely hurting final precision |
-| E8 | E8-relative-actions | (running) | relative/per-ts-norm, obs2, flow, 40k | – | – | – | TRI delta actions (user); RUNNING |
+| E8 | E8-relative-actions | (wandb) | relative/per-ts-norm, obs2, flow, 40k | 0.42 | 0.40 | 0.875 | 20k 0.42/0.838 → 40k 0.40/0.875. **Below baseline** (~0.52). Per-ts delta stats correct (near-term ±1px, far ~90px). TRI delta rep not a win for PushT's small fixed pixel action space + z-scored (unbounded) targets lose clip-sample stabilization |
 
 **Time note:** 100-step DDPM eval is ~45 min/eval (batch-1 rollouts), so E2 took ~2h48m.
 To fit the budget I gave E3 a single final eval and run E5/E4 on flow (10-step eval, ~10× faster)
