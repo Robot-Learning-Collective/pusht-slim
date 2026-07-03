@@ -120,14 +120,19 @@ class PushTAdapter:
         self._img_hist = [image] * self.obs_horizon
         self._state_hist = [state] * self.obs_horizon
 
-    def observe(self, obs):
-        # env obs dict -> batched, normalized (images, states) on device, each
-        # carrying the last obs_horizon frames stacked on a time axis.
-        # Feed the raw native-resolution frame; the encoder owns cropping (center
-        # crop in eval, random crop in train) so train and eval share one path.
+    def push(self, obs):
+        # Call once per ENV STEP so the history holds CONSECUTIVE frames, matching
+        # the dataset's consecutive-frame stacking (idx-1, idx) used in training.
+        # (If pushed only per replan, the stacked frames would be ACTION_CHUNK_SIZE
+        # env-steps apart and the policy would read a bogus, oversized velocity.)
         image, state = self._parse(obs)
         self._img_hist = (self._img_hist + [image])[-self.obs_horizon :]
         self._state_hist = (self._state_hist + [state])[-self.obs_horizon :]
+
+    def get(self):
+        # Current obs_horizon-frame stack -> batched, normalized, on device.
+        # Feed the raw native-resolution frame; the encoder owns cropping (center
+        # crop in eval, random crop in train) so train and eval share one path.
         images = torch.stack(self._img_hist, dim=0)  # (T, 3, 96, 96)
         states = torch.stack(self._state_hist, dim=0)  # (T, 2)
         return images.unsqueeze(0).to(self.device), states.unsqueeze(0).to(self.device)
@@ -155,7 +160,7 @@ def evaluate(policy, device, n_episodes, render, n_steps):
 
         info = {}
         while not done:
-            images_in, states_in = adapter.observe(obs)
+            images_in, states_in = adapter.get()
 
             # Predict a full action horizon, then map it back to env actions.
             actions = policy.inference(images_in, states_in, n_steps=n_steps)
@@ -164,6 +169,7 @@ def evaluate(policy, device, n_episodes, render, n_steps):
             # Receding horizon: execute one chunk, then replan from the new state.
             for action in actions[:ACTION_CHUNK_SIZE]:
                 obs, reward, terminated, truncated, info = env.step(action)
+                adapter.push(obs)  # keep obs history at env-step cadence
                 max_reward = max(max_reward, float(reward))
                 if render:
                     time.sleep(0.05)
