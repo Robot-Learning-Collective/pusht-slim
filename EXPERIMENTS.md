@@ -41,10 +41,15 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 
 | # | run name | wandb id | config | best SR | last SR | best AMR | notes |
 |---|---|---|---|---|---|---|---|
-| B0 | B0-baseline-ema-cosine | 0c3czg0e | obs1, flow-10, 50k | 0.58 | 0.36 | 0.95 | control; SR evals 0.44/0.58/0.40/0.48/0.36 |
-| E1 | E1-obs2-flow | (running) | obs2, flow-10, 50k | – | – | – | temporal context |
-| E2 | E2-obs1-diffusion | (queued) | obs1, DDPM-100, 50k | – | – | – | isolate objective |
+| B0 | B0-baseline-ema-cosine | 0c3czg0e | obs1, flow-10, 50k | 0.58 | 0.36 | 0.95 | control; SR 0.44/0.58/0.40/0.48/0.36 (bouncy) |
+| E1 | E1-obs2-flow | 7pd6cicq | obs2, flow-10, 50k | 0.54 | 0.54 | 0.89 | SR 0.48/0.52/0.52/0.50/0.54 — **stable ~0.52**, mean > B0's ~0.45 but plateau holds |
+| E2 | E2-obs1-diffusion | (running) | obs1, DDPM-100, 50k | – | – | – | isolate objective; eval@25k/50k |
 | E3 | E3-obs2-diffusion | (queued) | obs2, DDPM-100, 50k | – | – | – | ≈ lerobot DP recipe |
+
+**Note (eval bug, fixed):** early E1 eval showed SR 0.0 with healthy training loss — the eval
+adapter stacked obs at replan cadence (8 env steps apart) vs training's consecutive frames,
+so obs=2 read an 8× bogus velocity. Fixed to update history every env step (commit 9222561).
+obs=1 runs (B0, E2) were unaffected.
 
 _(updated as runs finish)_
 
