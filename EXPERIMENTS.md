@@ -64,6 +64,17 @@ obs=1 runs (B0, E2) were unaffected.
 
 _(updated as runs finish)_
 
+## E6 — eval-only sweep on the E1 checkpoint (30 ep each, so ±0.09 noise)
+Tests whether the plateau is an inference/closed-loop problem. It is NOT.
+- **Action chunk (replan cadence):** 8 → 0.47–0.57 (best), 4 → 0.47, **2 → 0.20, 1 → 0.23**.
+  Tighter replanning *hurts* — replanning from a shifted state every 1–2 steps breaks chunk
+  coherence (oscillation). The policy needs to execute coherent 8-step chunks.
+- **Denoising steps (chunk=8):** 10 → 0.47–0.57, 16 → 0.57, **50 → 0.40** (no gain).
+  More Euler steps do not sharpen the final settle.
+- (Identical chunk=8/10-step config scored 0.567 then 0.467 on two runs → confirms 30-ep noise.)
+Conclusion: the plateau is a **training/representation** limit, not inference or control cadence —
+consistent with E7 (encoder) and E4 (scale) being the levers that move it.
+
 ## Analysis — what the plateau actually is
 gym_pusht: `reward = clip(coverage/0.95, 0, 1)` and `terminated = is_success = coverage > 0.95`
 (pusht.py:257-258). So the episode **ends the moment coverage exceeds 95%**, and
