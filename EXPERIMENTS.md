@@ -36,9 +36,15 @@ one wandb run. Eval = 50 episodes (SR noise at 20 eps was ±0.11), EMA weights.
 | E6 | flow inference-steps sweep (10/16/50/100) | cheap precision test |
 
 ## Results
-| # | run name | wandb id | config | SR | AMR | notes |
-|---|---|---|---|---|---|---|
-| B0 | B0-baseline-ema-cosine | (running) | obs1, flow-10 | – | – | control |
+SR is noisy even at 50 eps — B0's per-eval SR ranged 0.36–0.58 within one run. So I
+report **best / last** SR across evals and lean on AMR (low variance) for ranking.
+
+| # | run name | wandb id | config | best SR | last SR | best AMR | notes |
+|---|---|---|---|---|---|---|---|
+| B0 | B0-baseline-ema-cosine | 0c3czg0e | obs1, flow-10, 50k | 0.58 | 0.36 | 0.95 | control; SR evals 0.44/0.58/0.40/0.48/0.36 |
+| E1 | E1-obs2-flow | (running) | obs2, flow-10, 50k | – | – | – | temporal context |
+| E2 | E2-obs1-diffusion | (queued) | obs1, DDPM-100, 50k | – | – | – | isolate objective |
+| E3 | E3-obs2-diffusion | (queued) | obs2, DDPM-100, 50k | – | – | – | ≈ lerobot DP recipe |
 
 _(updated as runs finish)_
 
