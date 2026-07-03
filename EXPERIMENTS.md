@@ -50,7 +50,8 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 | E5 | E5-vision-tokens | (wandb) | obs2, flow, tokens, 30k | 0.00 | 0.00 | 0.18 | **FAILS** (random); loss trains fine (0.41→0.095) but policy unusable — matches DiT-Block ablation: in-context ≈0%. Confirms global adaLN is right |
 | E4 | E4-big200m-flow | 9tr0zfle | obs2, flow, 221M, 25k | 0.60 | 0.60 | 0.905 | 12.5k 0.52/0.878 → 25k **0.60**/0.905. **Best SR so far**; 200M lifted SR above the plateau even at only 25k steps (vs 50k elsewhere) |
 | E7 | E7-resnet18-gn-scratch | (queued) | resnet18+GN+scratch, obs2, flow, 40k | – | – | – | orig-DP encoder (user); queued after E4 |
-| E8 | E8-relative-actions | (queued) | relative/per-ts-norm, obs2, flow, 40k | – | – | – | TRI delta actions (user); queued after E7 |
+| E7 | E7-resnet18-gn-scratch | lud9v5p0 | resnet18+GN+scratch, obs2, flow, 40k | **0.60** | 0.50 | **0.931** | 20k 0.60/0.931 → 40k 0.50/0.877. **Peaks ~20k then overfits/degrades** (from-scratch encoder, tiny data). Best flow AMR + ties best SR → BN+ImageNet-pretrained resnet34 was genuinely hurting final precision |
+| E8 | E8-relative-actions | (running) | relative/per-ts-norm, obs2, flow, 40k | – | – | – | TRI delta actions (user); RUNNING |
 
 **Time note:** 100-step DDPM eval is ~45 min/eval (batch-1 rollouts), so E2 took ~2h48m.
 To fit the budget I gave E3 a single final eval and run E5/E4 on flow (10-step eval, ~10× faster)
@@ -80,10 +81,18 @@ Evidence on *which* lever matters:
   pretrained**. BatchNorm's train/eval running-stat mismatch and ImageNet features on synthetic
   PushT frames are the prime remaining suspects for the missing final precision.
 
-## Conclusions
-_(pending E3/E4/E5/E6; preliminary: the ~0.5 SR plateau is a last-5%-coverage precision gap that
-obs-horizon, objective, and denoising steps do not fix — vision encoder (GroupNorm+from-scratch)
-and closed-loop cadence are the top untested levers.)_
+## Conclusions (updated — plateau IS breakable)
+The ~0.5 SR plateau is a last-5%-coverage precision gap. Objective (flow vs DDPM), obs-horizon,
+and denoising steps do **not** move it. **Two independent levers do, both to SR ~0.60:**
+- **E4 — model scale**: 221M transformer → 0.60 at 25k (still climbing; E4b tests 50k).
+- **E7 — vision encoder**: ResNet18 + GroupNorm + random init (original Diffusion Policy) → 0.60
+  at 20k with the best flow AMR (0.931). Confirms the BatchNorm + ImageNet-pretrained resnet34
+  was a real cause of the final-precision gap (BN train/eval stat mismatch; ImageNet features
+  ill-suited to synthetic PushT frames).
+
+Both **peak early (~20–25k) then plateau/degrade** on this small dataset — so denser evals and
+early stopping matter. Next payoff experiment = **combine** them (200M + resnet18-GN-scratch),
+with relative actions (E8) if it helps.
 
 ## Recommended next experiments (if this direction continues)
 1. **Vision encoder = ResNet18 + GroupNorm, trained from scratch** (lerobot DP's exact choice) —
