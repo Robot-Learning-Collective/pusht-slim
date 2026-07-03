@@ -16,27 +16,37 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
 import gym_pusht  
 
+def _envi(name, default):
+    return int(os.environ.get(name, default))
+
+
+def _envs(name, default):
+    return os.environ.get(name, default)
+
+
 ROBOT_DOF = 2
 PREDICTION_HORIZON = 16
 ACTION_CHUNK_SIZE = 8
 # Observation history fed to the policy. 1 = single frame (original). 2 gives the
 # policy velocity/temporal context and matches lerobot's Diffusion Policy default;
 # the extra frames are flattened into the global conditioning vector.
-OBS_HORIZON = 2
+# Key experiment knobs are env-overridable so a driver can queue runs without
+# editing code; each experiment still gets its own commit + report entry.
+OBS_HORIZON = _envi("OBS_HORIZON", 2)
 # Generative objective for the action head.
 #   "flow"      -> flow matching (velocity target, Euler integration).
 #   "diffusion" -> DDPM with a cosine (squaredcos_cap_v2) beta schedule and
 #                  epsilon prediction, i.e. lerobot Diffusion Policy's objective.
-OBJECTIVE = "flow"
+OBJECTIVE = _envs("OBJECTIVE", "flow")
 N_DENOISING_STEPS = 10          # flow-matching Euler steps at inference
 DIFFUSION_TRAIN_STEPS = 100     # DDPM forward-process resolution
-DIFFUSION_INFER_STEPS = 100     # DDPM reverse steps at inference
+DIFFUSION_INFER_STEPS = _envi("DIFFUSION_INFER_STEPS", 100)  # DDPM reverse steps
 DATASET_ID = "lerobot/pusht"
 # DiT sized to ~47.5M (matching lerobot's DiT backbone): hidden 600, 6 layers, 8 heads
-N_HEADS = 8
-N_LAYERS = 6
-HIDDEN_DIM = 600
-TOTAL_STEPS = 50_000
+N_HEADS = _envi("N_HEADS", 8)
+N_LAYERS = _envi("N_LAYERS", 6)
+HIDDEN_DIM = _envi("HIDDEN_DIM", 600)
+TOTAL_STEPS = _envi("TOTAL_STEPS", 50_000)
 LR = 1e-4
 # Gradient clipping a la nanoGPT. torch.nn.utils.clip_grad_norm_ returns the
 # total pre-clip grad norm, which we log to watch for instability. Set to a
