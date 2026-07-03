@@ -51,6 +51,11 @@ VISION_MODE = _envs("VISION_MODE", "global")
 VISION_BACKBONE = _envs("VISION_BACKBONE", "resnet34")  # resnet18 | resnet34
 VISION_NORM = _envs("VISION_NORM", "batch")             # batch | group
 VISION_PRETRAINED = _envi("VISION_PRETRAINED", 1)       # 1 = ImageNet weights
+# Photometric augmentation (per-sample color jitter on the training frames, in
+# addition to the existing random crop). Helps fight the ~25k-step overfit seen
+# on the big models. Off by default; brightness/contrast/saturation only (no hue,
+# which is slow on CPU workers). Applied in the dataset (train only).
+AUGMENT = _envi("AUGMENT", 0)
 # Action parameterization.
 #   "absolute" -> predict absolute agent target positions, normalized to [-1, 1]
 #                 by the fixed [0,512] coord range (original).
@@ -239,6 +244,12 @@ class PushTDataset(Dataset):
         self.dataset = LeRobotDataset(dataset_id)
         self.prediction_horizon = prediction_horizon
         self.obs_horizon = obs_horizon
+        # per-sample photometric jitter (train only); same params across the frame
+        # stack so temporal (velocity) cues stay consistent.
+        self.jitter = (
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.0)
+            if AUGMENT else None
+        )
 
         # decode every frame once and keep it in RAM; afterwards each __getitem__
         print("Caching dataset in memory...")
@@ -293,6 +304,8 @@ class PushTDataset(Dataset):
             imgs.append(self.cache[i]["observation.image"])
             states.append(normalize(self.cache[i]["observation.state"]))
         img = torch.stack(imgs, dim=0)  # (H, 3, 96, 96)
+        if self.jitter is not None:
+            img = self.jitter(img)  # same jitter across the frame stack
         obs = torch.stack(states, dim=0)  # (H, 2)
 
         actions = torch.zeros(self.prediction_horizon, 2)
@@ -943,6 +956,7 @@ def main():
             "vision_norm": VISION_NORM,
             "vision_pretrained": VISION_PRETRAINED,
             "action_mode": ACTION_MODE,
+            "augment": AUGMENT,
             "diffusion_train_steps": DIFFUSION_TRAIN_STEPS,
             "diffusion_infer_steps": DIFFUSION_INFER_STEPS,
             "prediction_horizon": PREDICTION_HORIZON,
