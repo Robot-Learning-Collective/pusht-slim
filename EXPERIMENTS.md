@@ -43,8 +43,14 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 |---|---|---|---|---|---|---|---|
 | B0 | B0-baseline-ema-cosine | 0c3czg0e | obs1, flow-10, 50k | 0.58 | 0.36 | 0.95 | control; SR 0.44/0.58/0.40/0.48/0.36 (bouncy) |
 | E1 | E1-obs2-flow | 7pd6cicq | obs2, flow-10, 50k | 0.54 | 0.54 | 0.89 | SR 0.48/0.52/0.52/0.50/0.54 — **stable ~0.52**, mean > B0's ~0.45 but plateau holds |
-| E2 | E2-obs1-diffusion | (running) | obs1, DDPM-100, 50k | – | – | – | isolate objective; eval@25k/50k |
-| E3 | E3-obs2-diffusion | (queued) | obs2, DDPM-100, 50k | – | – | – | ≈ lerobot DP recipe |
+| E2 | E2-obs1-diffusion | 6bz09nbu | obs1, DDPM-100, 50k | 0.54 | 0.54 | 0.96 | 25k 0.48/0.935 → 50k 0.54/0.960. **Highest AMR**; DDPM sampler works; still plateau |
+| E3 | E3-obs2-diffusion | (running) | obs2, DDPM-100, 50k | – | – | – | ≈ lerobot DP recipe; single final eval (cost) |
+| E5 | E5-vision-tokens | (queued) | obs2, flow, tokens, 30k | – | – | – | in-context visual tokens |
+| E4 | E4-big200m-flow | (queued) | obs2, flow, 221M, 25k | – | – | – | ~200M scale test |
+
+**Time note:** 100-step DDPM eval is ~45 min/eval (batch-1 rollouts), so E2 took ~2h48m.
+To fit the budget I gave E3 a single final eval and run E5/E4 on flow (10-step eval, ~10× faster)
+at reduced steps (signal is clear by ~25-30k).
 
 **Note (eval bug, fixed):** early E1 eval showed SR 0.0 with healthy training loss — the eval
 adapter stacked obs at replan cadence (8 env steps apart) vs training's consecutive frames,
