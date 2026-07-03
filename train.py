@@ -51,6 +51,18 @@ VISION_MODE = _envs("VISION_MODE", "global")
 VISION_BACKBONE = _envs("VISION_BACKBONE", "resnet34")  # resnet18 | resnet34
 VISION_NORM = _envs("VISION_NORM", "batch")             # batch | group
 VISION_PRETRAINED = _envi("VISION_PRETRAINED", 1)       # 1 = ImageNet weights
+# Action parameterization.
+#   "absolute" -> predict absolute agent target positions, normalized to [-1, 1]
+#                 by the fixed [0,512] coord range (original).
+#   "relative" -> predict the chunk as DELTAS from the current agent position,
+#                 z-scored PER HORIZON-INDEX by dataset statistics (TRI-style).
+#                 Centers targets near 0 and makes each step's scale uniform, so
+#                 fine end-of-episode corrections are easier to represent.
+ACTION_MODE = _envs("ACTION_MODE", "absolute")
+# Per-horizon-index delta stats (PREDICTION_HORIZON, ROBOT_DOF), filled by the
+# dataset when ACTION_MODE == "relative"; read by the eval adapter + inference.
+ACTION_LOC = None
+ACTION_SCALE = None
 N_DENOISING_STEPS = 10          # flow-matching Euler steps at inference
 DIFFUSION_TRAIN_STEPS = 100     # DDPM forward-process resolution
 DIFFUSION_INFER_STEPS = _envi("DIFFUSION_INFER_STEPS", 100)  # DDPM reverse steps
@@ -115,32 +127,37 @@ class PushTAdapter:
     sees model-ready tensors going in and env-ready actions coming out.
     """
 
-    def __init__(self, device, obs_horizon=OBS_HORIZON):
+    def __init__(self, device, obs_horizon=OBS_HORIZON, action_mode=ACTION_MODE):
         self.device = device
         self.obs_horizon = obs_horizon
+        self.action_mode = action_mode
         self._img_hist = None
         self._state_hist = None
+        self._raw_pos = None  # current raw agent pos (pixels), for relative actions
 
     def _parse(self, obs):
         image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1).float() / 255.0
-        state = normalize(torch.from_numpy(obs["agent_pos"]).float())
-        return image, state
+        raw_state = torch.from_numpy(obs["agent_pos"]).float()
+        state = normalize(raw_state)
+        return image, state, raw_state
 
     def reset(self, obs):
         # Prime the history with the first frame repeated, so the very first
         # decision sees a full obs_horizon stack (no velocity yet, as expected).
-        image, state = self._parse(obs)
+        image, state, raw = self._parse(obs)
         self._img_hist = [image] * self.obs_horizon
         self._state_hist = [state] * self.obs_horizon
+        self._raw_pos = raw
 
     def push(self, obs):
         # Call once per ENV STEP so the history holds CONSECUTIVE frames, matching
         # the dataset's consecutive-frame stacking (idx-1, idx) used in training.
         # (If pushed only per replan, the stacked frames would be ACTION_CHUNK_SIZE
         # env-steps apart and the policy would read a bogus, oversized velocity.)
-        image, state = self._parse(obs)
+        image, state, raw = self._parse(obs)
         self._img_hist = (self._img_hist + [image])[-self.obs_horizon :]
         self._state_hist = (self._state_hist + [state])[-self.obs_horizon :]
+        self._raw_pos = raw
 
     def get(self):
         # Current obs_horizon-frame stack -> batched, normalized, on device.
@@ -151,8 +168,14 @@ class PushTAdapter:
         return images.unsqueeze(0).to(self.device), states.unsqueeze(0).to(self.device)
 
     def act(self, actions):
+        actions = actions.squeeze(0).cpu()  # (PREDICTION_HORIZON, DOF)
+        if self.action_mode == "relative":
+            # normalized delta -> pixel delta (per timestep) -> absolute pos
+            deltas = actions * ACTION_SCALE + ACTION_LOC
+            abs_actions = deltas + self._raw_pos
+            return abs_actions.numpy()
         # policy output in [-1, 1] -> env actions in [0, 512]
-        return unnormalize(actions).squeeze(0).cpu().numpy()
+        return unnormalize(actions).numpy()
 
 
 def evaluate(policy, device, n_episodes, render, n_steps):
@@ -230,6 +253,28 @@ class PushTDataset(Dataset):
         self.episode_indices = np.array(self.dataset.hf_dataset["episode_index"])
         print("Done caching.")
 
+        # For relative actions: gather per-horizon-index delta statistics
+        # (a[idx+k] - agent_pos[idx]) over every valid sample, then store the
+        # per-index mean/std as module globals used by both the training target
+        # and the eval adapter. Uses raw pixel coords (not the [-1,1] norm).
+        if ACTION_MODE == "relative":
+            global ACTION_LOC, ACTION_SCALE
+            deltas = [[] for _ in range(self.prediction_horizon)]
+            n = len(self.dataset)
+            for idx in range(n):
+                ep = self.episode_indices[idx]
+                p_cur = self.cache[idx]["observation.state"]
+                for k in range(self.prediction_horizon):
+                    i = idx + k
+                    if i < n and self.episode_indices[i] == ep:
+                        deltas[k].append(self.cache[i]["action"] - p_cur)
+            loc = torch.stack([torch.stack(d).mean(0) for d in deltas])   # (PH, DOF)
+            scale = torch.stack([torch.stack(d).std(0) for d in deltas])  # (PH, DOF)
+            ACTION_LOC = loc
+            ACTION_SCALE = scale.clamp(min=1e-3)
+            print(f"[relative actions] delta loc/scale per-timestep computed; "
+                  f"loc[0]={loc[0].tolist()}, scale[-1]={ACTION_SCALE[-1].tolist()}")
+
     def __len__(self):
         return len(self.dataset)
 
@@ -252,11 +297,16 @@ class PushTDataset(Dataset):
 
         actions = torch.zeros(self.prediction_horizon, 2)
         mask = torch.zeros(self.prediction_horizon, 2)
-        
+        p_cur = self.cache[idx]["observation.state"]  # raw current agent pos
+
         for k in range(self.prediction_horizon):
             i = idx + k
             if i < len(self.dataset) and self.episode_indices[i] == current_episode:
-                actions[k] = normalize(self.cache[i]["action"])
+                if ACTION_MODE == "relative":
+                    # delta from current pos, z-scored by this timestep's stats
+                    actions[k] = (self.cache[i]["action"] - p_cur - ACTION_LOC[k]) / ACTION_SCALE[k]
+                else:
+                    actions[k] = normalize(self.cache[i]["action"])
                 mask[k] = 1.0
 
         return img, obs, actions.flatten(), mask.flatten()
@@ -489,12 +539,16 @@ class DiTPolicy(nn.Module):
         objective=OBJECTIVE,
         diffusion_train_steps=DIFFUSION_TRAIN_STEPS,
         vision_mode=VISION_MODE,
+        action_mode=ACTION_MODE,
     ):
         super().__init__()
         self.obs_horizon = obs_horizon
         self.objective = objective
         self.diffusion_train_steps = diffusion_train_steps
         self.vision_mode = vision_mode
+        # relative (z-scored) targets aren't bounded to [-1,1], so skip the clamp
+        self.action_mode = action_mode
+        self._clamp = action_mode != "relative"
         # conditioning = obs_horizon*(image + state) + timestep, all hidden_dim
         # wide. The per-frame image/state features are flattened across time and
         # concatenated with the timestep embedding into one global cond vector.
@@ -587,7 +641,7 @@ class DiTPolicy(nn.Module):
             t = torch.full((batch_size,), i / n_steps).to(images.device)
             v = self.forward(x, t, images, obs)
             x = x + v * dt
-        return x.clamp(-1.0, 1.0)
+        return x.clamp(-1.0, 1.0) if self._clamp else x
 
     @torch.no_grad()
     def _ddpm_sample(self, images, obs):
@@ -605,7 +659,8 @@ class DiTPolicy(nn.Module):
             acp_prev = acp[t - 1] if t > 0 else torch.ones_like(acp_t)
             # predict x0 from eps, clip to the normalized action range
             x0 = (x - (1.0 - acp_t).sqrt() * eps) / acp_t.sqrt()
-            x0 = x0.clamp(-1.0, 1.0)
+            if self._clamp:
+                x0 = x0.clamp(-1.0, 1.0)
             coef_x0 = (acp_prev.sqrt() * betas[t]) / (1.0 - acp_t)
             coef_xt = (alphas[t].sqrt() * (1.0 - acp_prev)) / (1.0 - acp_t)
             mean = coef_x0 * x0 + coef_xt * x
@@ -614,7 +669,7 @@ class DiTPolicy(nn.Module):
                 x = mean + var.sqrt() * torch.randn_like(x)
             else:
                 x = mean
-        return x.clamp(-1.0, 1.0)
+        return x.clamp(-1.0, 1.0) if self._clamp else x
 
 
 # =============================================================================
@@ -887,6 +942,7 @@ def main():
             "vision_backbone": VISION_BACKBONE,
             "vision_norm": VISION_NORM,
             "vision_pretrained": VISION_PRETRAINED,
+            "action_mode": ACTION_MODE,
             "diffusion_train_steps": DIFFUSION_TRAIN_STEPS,
             "diffusion_infer_steps": DIFFUSION_INFER_STEPS,
             "prediction_horizon": PREDICTION_HORIZON,
