@@ -45,6 +45,12 @@ OBJECTIVE = _envs("OBJECTIVE", "flow")
 #               the action tokens in self-attention; adaLN cond carries only
 #               state+timestep. Tests the "visual connection" hypothesis.
 VISION_MODE = _envs("VISION_MODE", "global")
+# Vision backbone choices. lerobot's Diffusion Policy (its ~80% PushT recipe) uses
+# resnet18 + GroupNorm trained FROM SCRATCH; the original code here used resnet34
+# + BatchNorm + ImageNet-pretrained. These toggles let us test that difference.
+VISION_BACKBONE = _envs("VISION_BACKBONE", "resnet34")  # resnet18 | resnet34
+VISION_NORM = _envs("VISION_NORM", "batch")             # batch | group
+VISION_PRETRAINED = _envi("VISION_PRETRAINED", 1)       # 1 = ImageNet weights
 N_DENOISING_STEPS = 10          # flow-matching Euler steps at inference
 DIFFUSION_TRAIN_STEPS = 100     # DDPM forward-process resolution
 DIFFUSION_INFER_STEPS = _envi("DIFFUSION_INFER_STEPS", 100)  # DDPM reverse steps
@@ -295,6 +301,17 @@ class SpatialSoftmax(nn.Module):
         return keypoints.reshape(batch, self._out_c, 2)
 
 
+def _replace_bn_with_gn(module):
+    """Recursively swap every BatchNorm2d for a GroupNorm (num_groups = C // 16),
+    matching lerobot's Diffusion Policy vision encoder."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            c = child.num_features
+            setattr(module, name, nn.GroupNorm(max(1, c // 16), c))
+        else:
+            _replace_bn_with_gn(child)
+
+
 class ImageEncoder(nn.Module):
     """lerobot/Diffusion-Policy-style vision encoder.
 
@@ -306,21 +323,31 @@ class ImageEncoder(nn.Module):
     a single code path.
     """
 
-    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS, mode="global"):
+    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS, mode="global",
+                 backbone=VISION_BACKBONE, norm=VISION_NORM, pretrained=VISION_PRETRAINED):
         super().__init__()
         self.mode = mode
-        weights = models.ResNet34_Weights.DEFAULT
-        resnet = models.resnet34(weights=weights)
+        ctor = {"resnet18": models.resnet18, "resnet34": models.resnet34}[backbone]
+        weights_enum = {
+            "resnet18": models.ResNet18_Weights,
+            "resnet34": models.ResNet34_Weights,
+        }[backbone]
+        weights = weights_enum.DEFAULT if pretrained else None
+        resnet = ctor(weights=weights)
 
-        # Reuse the exact normalization the pretrained weights expect, sourced
-        # from the weights metadata so it can't drift out of sync.
-        preprocess = weights.transforms()
-        self.register_buffer(
-            "img_mean", torch.tensor(preprocess.mean).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
-        )
+        # GroupNorm swap (lerobot uses GN, num_groups = channels // 16) — recommended
+        # when not ImageNet-pretrained, avoids BatchNorm's train/eval stat mismatch.
+        if norm == "group":
+            _replace_bn_with_gn(resnet)
+
+        # ImageNet normalization stats (from the pretrained weights when available,
+        # else the standard constants — the model just needs a consistent scale).
+        if weights is not None:
+            mean, std = weights.transforms().mean, weights.transforms().std
+        else:
+            mean, std = IMG_MEAN, IMG_STD
+        self.register_buffer("img_mean", torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer("img_std", torch.tensor(std).view(1, 3, 1, 1))
 
         # Same crop window for the whole batch (matching lerobot's RandomCrop).
         # We index with tensors instead of torchvision's RandomCrop because the
@@ -857,6 +884,9 @@ def main():
             "obs_horizon": OBS_HORIZON,
             "objective": OBJECTIVE,
             "vision_mode": VISION_MODE,
+            "vision_backbone": VISION_BACKBONE,
+            "vision_norm": VISION_NORM,
+            "vision_pretrained": VISION_PRETRAINED,
             "diffusion_train_steps": DIFFUSION_TRAIN_STEPS,
             "diffusion_infer_steps": DIFFUSION_INFER_STEPS,
             "prediction_horizon": PREDICTION_HORIZON,
