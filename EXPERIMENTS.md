@@ -52,6 +52,8 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 | E7 | E7-resnet18-gn-scratch | (queued) | resnet18+GN+scratch, obs2, flow, 40k | – | – | – | orig-DP encoder (user); queued after E4 |
 | E7 | E7-resnet18-gn-scratch | lud9v5p0 | resnet18+GN+scratch, obs2, flow, 40k | **0.60** | 0.50 | **0.931** | 20k 0.60/0.931 → 40k 0.50/0.877. **Peaks ~20k then overfits/degrades** (from-scratch encoder, tiny data). Best flow AMR + ties best SR → BN+ImageNet-pretrained resnet34 was genuinely hurting final precision |
 | E8 | E8-relative-actions | (wandb) | relative/per-ts-norm, obs2, flow, 40k | 0.42 | 0.40 | 0.875 | 20k 0.42/0.838 → 40k 0.40/0.875. **Below baseline** (~0.52). Per-ts delta stats correct (near-term ±1px, far ~90px). TRI delta rep not a win for PushT's small fixed pixel action space + z-scored (unbounded) targets lose clip-sample stabilization |
+| E9 | E9-combo-200m-rn18gn | lop3744f | 200M + resnet18+GN+scratch, obs2, flow, 30k | **0.66** | 0.66 | **0.949** | 5k .18 →10k .54 →15k .52 →20k .50 →25k .54 →30k **.66** — still climbing at 30k. Combo of the two winning levers; best AMR overall |
+| E4b | E4b-big200m-50k | mg16yqz1 | 200M, obs2, flow, 50k | **0.68** | 0.60 | 0.901 | 10k .36 →20k .48 →30k **.68** →40k .52 →50k .60. **Best single eval (0.68)** but noisy/non-monotonic; 200M + more steps confirms scale is the dominant lever |
 
 **Time note:** 100-step DDPM eval is ~45 min/eval (batch-1 rollouts), so E2 took ~2h48m.
 To fit the budget I gave E3 a single final eval and run E5/E4 on flow (10-step eval, ~10× faster)
@@ -104,6 +106,32 @@ and denoising steps do **not** move it. **Two independent levers do, both to SR 
 Both **peak early (~20–25k) then plateau/degrade** on this small dataset — so denser evals and
 early stopping matter. Next payoff experiment = **combine** them (200M + resnet18-GN-scratch),
 with relative actions (E8) if it helps.
+
+### Final picture (all experiments done)
+- **Scale is the dominant lever.** Every 200M run (E4, E4b, E9) peaks at **SR 0.60–0.68**, vs the
+  ~0.50–0.55 plateau of the 47M model. Best single eval: **E4b 0.68 @ 30k**; best AMR: **E9 0.949**.
+- **Vision encoder (resnet18+GN+scratch) is the dominant lever *at small scale*** (E7: 0.50→0.60),
+  but at 200M it washes out — E4b (resnet34+BN+pretrained) matched E9 (resnet18+GN+scratch). The big
+  transformer compensates for the weaker encoder.
+- **Combining** scale + better encoder (E9) did **not** clearly beat scale alone (0.66 vs E4b 0.68) —
+  within noise. E9 was still climbing at 30k, so a longer E9 might edge higher.
+- **Did NOT help:** DDPM objective, obs_horizon=2, 100 denoising steps, tighter replan cadence,
+  in-context vision tokens (fails), relative/delta actions.
+- **Eval noise is large** (±0.07 at 50 ep; both 200M runs bounce ±0.1 between evals). Treat SR
+  differences <0.1 as noise; the robust signal is "47M ≈ 0.5, 200M ≈ 0.6–0.65."
+- **Still short of the ~0.80 diffusion-policy target.** Scaling bought ~+0.10–0.15 SR. Closing the
+  rest likely needs: (a) longer 200M training with EMA + early-stop on a denser eval; (b) stronger
+  augmentation to fight the early overfit/degrade; (c) more/better data or action-chunk tuning; or
+  (d) an architecture the low-data regime favours (the DiT-Block paper's point: put compute in the
+  CNN tokenizer, not only the transformer).
+
+### Recommended next steps
+1. **Longer E9** (200M + resnet18-GN-scratch) to 60–80k with EMA + eval every 5k + keep best-ckpt —
+   it was still climbing at 30k and has the best AMR.
+2. **Augmentation** (color jitter, small rotations on top of the random crop) to delay the ~25k
+   overfit that caps the 200M runs.
+3. **Report SR as mean over the last N evals** (or eval 100+ episodes on the final ckpt) to cut noise
+   before comparing candidates.
 
 ## Recommended next experiments (if this direction continues)
 1. **Vision encoder = ResNet18 + GroupNorm, trained from scratch** (lerobot DP's exact choice) —
