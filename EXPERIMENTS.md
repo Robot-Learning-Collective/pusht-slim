@@ -33,7 +33,9 @@ one wandb run. Eval = 50 episodes (SR noise at 20 eps was ±0.11), EMA weights.
 | E3 | obs=2 + best objective | closest to lerobot DP recipe |
 | E4 | bigger model (~200M) on best config | user request; scaling test |
 | E5 | vision as in-context tokens | user hypothesis (papers predict worse) |
-| E6 | flow inference-steps sweep (10/16/50/100) | cheap precision test |
+| E6 | flow inference-steps + action-chunk sweep | cheap closed-loop/precision test |
+| E7 | ResNet18 + GroupNorm, random init (orig. Diffusion Policy encoder) | vision-encoder is prime plateau suspect (user request) |
+| E8 | relative/delta actions, per-timestep z-score norm (TRI) | final-precision lever (user request) |
 
 ## Results
 SR is noisy even at 50 eps — B0's per-eval SR ranged 0.36–0.58 within one run. So I
@@ -46,7 +48,9 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 | E2 | E2-obs1-diffusion | 6bz09nbu | obs1, DDPM-100, 50k | 0.54 | 0.54 | 0.96 | 25k 0.48/0.935 → 50k 0.54/0.960. **Highest AMR**; DDPM sampler works; still plateau |
 | E3 | E3-obs2-diffusion | hvmqdz3y | obs2, DDPM-100, 50k | 0.45 | 0.45 | 0.93 | lerobot-recipe combo; **plateau holds** (40-ep final eval) |
 | E5 | E5-vision-tokens | (wandb) | obs2, flow, tokens, 30k | 0.00 | 0.00 | 0.18 | **FAILS** (random); loss trains fine (0.41→0.095) but policy unusable — matches DiT-Block ablation: in-context ≈0%. Confirms global adaLN is right |
-| E4 | E4-big200m-flow | (queued) | obs2, flow, 221M, 25k | – | – | – | ~200M scale test |
+| E4 | E4-big200m-flow | 9tr0zfle | obs2, flow, 221M, 25k | – | – | – | ~200M scale test — RUNNING |
+| E7 | E7-resnet18-gn-scratch | (queued) | resnet18+GN+scratch, obs2, flow, 40k | – | – | – | orig-DP encoder (user); queued after E4 |
+| E8 | E8-relative-actions | (queued) | relative/per-ts-norm, obs2, flow, 40k | – | – | – | TRI delta actions (user); queued after E7 |
 
 **Time note:** 100-step DDPM eval is ~45 min/eval (batch-1 rollouts), so E2 took ~2h48m.
 To fit the budget I gave E3 a single final eval and run E5/E4 on flow (10-step eval, ~10× faster)
