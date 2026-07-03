@@ -38,6 +38,13 @@ OBS_HORIZON = _envi("OBS_HORIZON", 2)
 #   "diffusion" -> DDPM with a cosine (squaredcos_cap_v2) beta schedule and
 #                  epsilon prediction, i.e. lerobot Diffusion Policy's objective.
 OBJECTIVE = _envs("OBJECTIVE", "flow")
+# How visual features enter the transformer.
+#   "global" -> pool each frame to one vector, concat into the adaLN cond (default,
+#               matches lerobot DiT and the DiT-Block Policy ablation winner).
+#   "tokens" -> feed the ResNet spatial feature map as in-context tokens alongside
+#               the action tokens in self-attention; adaLN cond carries only
+#               state+timestep. Tests the "visual connection" hypothesis.
+VISION_MODE = _envs("VISION_MODE", "global")
 N_DENOISING_STEPS = 10          # flow-matching Euler steps at inference
 DIFFUSION_TRAIN_STEPS = 100     # DDPM forward-process resolution
 DIFFUSION_INFER_STEPS = _envi("DIFFUSION_INFER_STEPS", 100)  # DDPM reverse steps
@@ -299,8 +306,9 @@ class ImageEncoder(nn.Module):
     a single code path.
     """
 
-    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
+    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS, mode="global"):
         super().__init__()
+        self.mode = mode
         weights = models.ResNet34_Weights.DEFAULT
         resnet = models.resnet34(weights=weights)
 
@@ -328,8 +336,16 @@ class ImageEncoder(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 3, crop_size, crop_size)
             feat_shape = self.backbone(dummy).shape[1:]  # (C, H, W)
-        self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
-        self.fc = nn.Linear(num_kp * 2, out_dim)
+        if mode == "tokens":
+            # In-context mode: emit the spatial feature map as H*W tokens, each
+            # projected to out_dim. No pooling — spatial layout is preserved and
+            # handed to the transformer's self-attention.
+            self._feat_c = feat_shape[0]
+            self.n_tokens = feat_shape[1] * feat_shape[2]
+            self.token_proj = nn.Linear(self._feat_c, out_dim)
+        else:
+            self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
+            self.fc = nn.Linear(num_kp * 2, out_dim)
 
     def random_crop(self, images):
         # One random crop window for the whole batch, expressed entirely in
@@ -348,6 +364,11 @@ class ImageEncoder(nn.Module):
         images = (images - self.img_mean) / self.img_std
 
         x = self.backbone(images)
+        if self.mode == "tokens":
+            # (N, C, H, W) -> (N, H*W, C) -> (N, H*W, out_dim)
+            n, c, h, w = x.shape
+            x = x.flatten(2).transpose(1, 2)
+            return self.token_proj(x)
         x = self.pool(x).flatten(1)  # (batch, num_kp * 2)
         return self.fc(x)
 
@@ -440,15 +461,19 @@ class DiTPolicy(nn.Module):
         obs_horizon=OBS_HORIZON,
         objective=OBJECTIVE,
         diffusion_train_steps=DIFFUSION_TRAIN_STEPS,
+        vision_mode=VISION_MODE,
     ):
         super().__init__()
         self.obs_horizon = obs_horizon
         self.objective = objective
         self.diffusion_train_steps = diffusion_train_steps
+        self.vision_mode = vision_mode
         # conditioning = obs_horizon*(image + state) + timestep, all hidden_dim
         # wide. The per-frame image/state features are flattened across time and
         # concatenated with the timestep embedding into one global cond vector.
-        self.image_encoder = ImageEncoder(out_dim=hidden_dim)
+        # In "tokens" mode the image path leaves the cond vector (state+timestep
+        # only) and enters as in-context tokens in forward() instead.
+        self.image_encoder = ImageEncoder(out_dim=hidden_dim, mode=vision_mode)
         self.timestep_encoder = TimestepEncoder(out_dim=hidden_dim)
         self.state_encoder = StateEncoder(out_dim=hidden_dim)
 
@@ -459,8 +484,18 @@ class DiTPolicy(nn.Module):
             torch.zeros(1, prediction_horizon, hidden_dim)
         )
 
+        if vision_mode == "tokens":
+            # cond = state(obs_horizon) + timestep; images enter as tokens.
+            n_cond_vecs = obs_horizon + 1
+            n_vis_tokens = self.image_encoder.n_tokens * obs_horizon
+            self.vis_pos_emb = nn.Parameter(
+                torch.zeros(1, n_vis_tokens, hidden_dim)
+            )
+        else:
+            n_cond_vecs = 2 * obs_horizon + 1
+
         self.cond_proj = nn.Sequential(
-            nn.Linear(hidden_dim * (2 * obs_horizon + 1), hidden_dim * 4),
+            nn.Linear(hidden_dim * n_cond_vecs, hidden_dim * 4),
             nn.GELU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
@@ -485,17 +520,29 @@ class DiTPolicy(nn.Module):
         # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
         # images: (batch, obs_horizon, 3, 96, 96), obs: (batch, obs_horizon, DOF)
         B, H = images.shape[0], images.shape[1]
-        images_cond = self.image_encoder(images.reshape(B * H, *images.shape[2:]))
-        images_cond = images_cond.reshape(B, -1)  # (B, H * hidden)
+        img_feat = self.image_encoder(images.reshape(B * H, *images.shape[2:]))
         obs_cond = self.state_encoder(obs.reshape(B * H, obs.shape[-1]))
         obs_cond = obs_cond.reshape(B, -1)  # (B, H * hidden)
         timestep_cond = self.timestep_encoder(t)
-        cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
-        cond = self.cond_proj(cond)
 
-        x = self.action_proj(x_t)
-        x = x + self.action_pos_emb
-        
+        x = self.action_proj(x_t) + self.action_pos_emb  # (B, PH, hidden)
+
+        if self.vision_mode == "tokens":
+            # image features are per-frame token sets -> (B, H*n_tokens, hidden)
+            vis = img_feat.reshape(B, -1, img_feat.shape[-1]) + self.vis_pos_emb
+            cond = self.cond_proj(torch.cat([obs_cond, timestep_cond], dim=-1))
+            # in-context: visual tokens attend jointly with action tokens
+            seq = torch.cat([vis, x], dim=1)
+            for block in self.blocks:
+                seq = block(seq, cond)
+            x = seq[:, -PREDICTION_HORIZON:, :]  # read out action tokens
+            return self.action_out(x)
+
+        # global mode: pool image to one vector per frame, put it in the cond
+        images_cond = img_feat.reshape(B, -1)  # (B, H * hidden)
+        cond = self.cond_proj(
+            torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
+        )
         for block in self.blocks:
             x = block(x, cond)
         return self.action_out(x)
@@ -809,6 +856,7 @@ def main():
             "robot_dof": ROBOT_DOF,
             "obs_horizon": OBS_HORIZON,
             "objective": OBJECTIVE,
+            "vision_mode": VISION_MODE,
             "diffusion_train_steps": DIFFUSION_TRAIN_STEPS,
             "diffusion_infer_steps": DIFFUSION_INFER_STEPS,
             "prediction_horizon": PREDICTION_HORIZON,
