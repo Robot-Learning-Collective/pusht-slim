@@ -45,7 +45,7 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 | E1 | E1-obs2-flow | 7pd6cicq | obs2, flow-10, 50k | 0.54 | 0.54 | 0.89 | SR 0.48/0.52/0.52/0.50/0.54 — **stable ~0.52**, mean > B0's ~0.45 but plateau holds |
 | E2 | E2-obs1-diffusion | 6bz09nbu | obs1, DDPM-100, 50k | 0.54 | 0.54 | 0.96 | 25k 0.48/0.935 → 50k 0.54/0.960. **Highest AMR**; DDPM sampler works; still plateau |
 | E3 | E3-obs2-diffusion | hvmqdz3y | obs2, DDPM-100, 50k | 0.45 | 0.45 | 0.93 | lerobot-recipe combo; **plateau holds** (40-ep final eval) |
-| E5 | E5-vision-tokens | (queued) | obs2, flow, tokens, 30k | – | – | – | in-context visual tokens |
+| E5 | E5-vision-tokens | (wandb) | obs2, flow, tokens, 30k | 0.00 | 0.00 | 0.18 | **FAILS** (random); loss trains fine (0.41→0.095) but policy unusable — matches DiT-Block ablation: in-context ≈0%. Confirms global adaLN is right |
 | E4 | E4-big200m-flow | (queued) | obs2, flow, 221M, 25k | – | – | – | ~200M scale test |
 
 **Time note:** 100-step DDPM eval is ~45 min/eval (batch-1 rollouts), so E2 took ~2h48m.
