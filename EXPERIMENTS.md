@@ -48,7 +48,7 @@ report **best / last** SR across evals and lean on AMR (low variance) for rankin
 | E2 | E2-obs1-diffusion | 6bz09nbu | obs1, DDPM-100, 50k | 0.54 | 0.54 | 0.96 | 25k 0.48/0.935 → 50k 0.54/0.960. **Highest AMR**; DDPM sampler works; still plateau |
 | E3 | E3-obs2-diffusion | hvmqdz3y | obs2, DDPM-100, 50k | 0.45 | 0.45 | 0.93 | lerobot-recipe combo; **plateau holds** (40-ep final eval) |
 | E5 | E5-vision-tokens | (wandb) | obs2, flow, tokens, 30k | 0.00 | 0.00 | 0.18 | **FAILS** (random); loss trains fine (0.41→0.095) but policy unusable — matches DiT-Block ablation: in-context ≈0%. Confirms global adaLN is right |
-| E4 | E4-big200m-flow | 9tr0zfle | obs2, flow, 221M, 25k | – | – | – | ~200M scale test — RUNNING |
+| E4 | E4-big200m-flow | 9tr0zfle | obs2, flow, 221M, 25k | 0.60 | 0.60 | 0.905 | 12.5k 0.52/0.878 → 25k **0.60**/0.905. **Best SR so far**; 200M lifted SR above the plateau even at only 25k steps (vs 50k elsewhere) |
 | E7 | E7-resnet18-gn-scratch | (queued) | resnet18+GN+scratch, obs2, flow, 40k | – | – | – | orig-DP encoder (user); queued after E4 |
 | E8 | E8-relative-actions | (queued) | relative/per-ts-norm, obs2, flow, 40k | – | – | – | TRI delta actions (user); queued after E7 |
 
