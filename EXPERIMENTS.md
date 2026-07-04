@@ -133,6 +133,21 @@ with relative actions (E8) if it helps.
 3. **Report SR as mean over the last N evals** (or eval 100+ episodes on the final ckpt) to cut noise
    before comparing candidates.
 
+## Round 2 — big combos (100k steps, 100-episode evals, EMA+cosine)
+Combining the confirmed winners at scale + long training. 100-ep evals (±0.05 noise).
+
+| # | run | wandb | config | 25k | 50k | 75k | 100k | verdict |
+|---|---|---|---|---|---|---|---|---|
+| C1 | C1-200m-rn18gn-100k | 6ascw2t5 | 200M + resnet18+GN+scratch | 0.57 | 0.61 | 0.68 | **0.72** | **monotonic climb, best yet, still rising** |
+| C2 | C2-200m-rn18gn-aug-100k | (running) | C1 + color-jitter aug | – | – | – | – | RUNNING |
+| C3 | C3-300m-rn18gn-aug-100k | (queued) | ~300M + rn18GN + aug | – | – | – | – | more transformer scale |
+| C4 | C4-200m-rn34gn-aug-100k | (queued) | 200M + rn34GN + aug | – | – | – | – | bigger CNN tokenizer |
+
+**C1 is the breakthrough: SR 0.72 at 100k** (AMR ~0.92), a clean monotonic climb from 0.57@25k —
+i.e. the 200M + resnet18-GN-scratch recipe just needed **more training**. This nearly closes the
+gap to the ~0.80 diffusion-policy target and confirms: **scale + from-scratch GN encoder + long
+training** is the winning combination. C1 was still rising at 100k → even longer may go higher.
+
 ## Recommended next experiments (if this direction continues)
 1. **Vision encoder = ResNet18 + GroupNorm, trained from scratch** (lerobot DP's exact choice) —
    highest-value untested lever for the final-precision gap.
