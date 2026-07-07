@@ -139,14 +139,43 @@ Combining the confirmed winners at scale + long training. 100-ep evals (±0.05 n
 | # | run | wandb | config | 25k | 50k | 75k | 100k | verdict |
 |---|---|---|---|---|---|---|---|---|
 | C1 | C1-200m-rn18gn-100k | 6ascw2t5 | 200M + resnet18+GN+scratch | 0.57 | 0.61 | 0.68 | **0.72** | **monotonic climb, best yet, still rising** |
-| C2 | C2-200m-rn18gn-aug-100k | (running) | C1 + color-jitter aug | – | – | – | – | RUNNING |
-| C3 | C3-300m-rn18gn-aug-100k | (queued) | ~300M + rn18GN + aug | – | – | – | – | more transformer scale |
-| C4 | C4-200m-rn34gn-aug-100k | (queued) | 200M + rn34GN + aug | – | – | – | – | bigger CNN tokenizer |
+| C2 | C2-200m-rn18gn-aug-100k | 73bh50sp | C1 + color-jitter aug | 0.61 | 0.61 | – | – | driver died at 50k (SR 0.61 there, on C1's pace); rerun as C6 (obs1) |
+| C3 | C3-300m-rn18gn-aug-100k | k93pgmnv | ~300M + rn18GN + aug | ? | – | – | – | ran to 25k ckpt but log+wandb captured nothing; rerun as C7 (obs1) |
+| C4 | C4-200m-rn34gn-aug-100k | k3vo1gz3 | 200M + rn34GN + aug | ? | – | – | – | same output loss; rerun as C8 (obs1) |
 
 **C1 is the breakthrough: SR 0.72 at 100k** (AMR ~0.92), a clean monotonic climb from 0.57@25k —
 i.e. the 200M + resnet18-GN-scratch recipe just needed **more training**. This nearly closes the
 gap to the ~0.80 diffusion-policy target and confirms: **scale + from-scratch GN encoder + long
 training** is the winning combination. C1 was still rising at 100k → even longer may go higher.
+
+## Round 3 — obs_horizon=1 reruns (user directive: obs1 only)
+The Jul-4 driver died mid-batch: C2 was cut at 50k (SR 0.61 there, on C1's trajectory) and
+C3/C4 ran but their logs + wandb never captured any results. Rerun of that batch at
+**OBS_HORIZON=1** (per user directive — all runs below are obs1; note round-2 numbers are
+obs2, so C5 is the new control). Same protocol: 100k steps, 100-ep evals every 25k, EMA, flow.
+
+| # | run | wandb | config (all obs1) | 25k | 50k | 75k | 100k | best |
+|---|---|---|---|---|---|---|---|---|
+| C5 | C5-200m-rn18gn-obs1-100k | px46uu6k | 200M + rn18GN-scratch (C1 recipe @ obs1, control) | 0.67 | 0.69 | 0.55 | 0.61 | 0.69 |
+| C6 | C6-200m-rn18gn-aug-obs1-100k | rx9h7ew8 | C5 + color-jitter aug | 0.68 | 0.62 | 0.58 | 0.65 | 0.68 |
+| C7 | C7-300m-rn18gn-aug-obs1-100k | z9zqfawz | ~300M (1024/14) + rn18GN + aug | **0.73** | 0.57 | 0.63 | **0.73** | **0.73** |
+| C8 | C8-200m-rn34gn-aug-obs1-100k | u5wo1cmf | 200M + rn34GN-scratch + aug | 0.55 | 0.69 | 0.50 | 0.62 | 0.69 |
+
+Takeaways:
+- **C7 (300M + aug) is the best run of the round — SR 0.73**, hit at both 25k and 100k; edges
+  out C1's 0.72 (obs2) as the best result overall. More transformer scale keeps paying.
+- **obs1 ≈ obs2 at 200M**: C5 (obs1 control) peaks 0.69 vs C1 (obs2) 0.72 — within eval noise
+  (±0.05 at 100 eps), but C1's climb was monotonic while C5 bounced (0.67→0.69→0.55→0.61).
+- **Color-jitter aug does not help at 200M** (C6 0.68 vs C5 0.69) — it was meant to fight the
+  ~25k overfit, but peaks and bounce look the same.
+- **resnet34-GN tokenizer is not better than resnet18-GN** (C8 0.69, and the weakest 25k/75k
+  evals of the round) — bigger CNN tokenizer is not the lever here.
+- All four runs are **non-monotonic** across evals (spread up to 0.18 within a run), unlike C1.
+  With differences this size, per-eval SR at 100 eps is still too noisy to rank 200M variants;
+  only C7's repeated 0.73 stands out.
+
+Next: extend C7 beyond 100k (it finished on a peak), and/or re-eval the best checkpoints
+(C7@25k, C7@100k, C5@50k) with 200+ episodes to get sub-±0.04 error bars before picking a winner.
 
 ## Recommended next experiments (if this direction continues)
 1. **Vision encoder = ResNet18 + GroupNorm, trained from scratch** (lerobot DP's exact choice) —
