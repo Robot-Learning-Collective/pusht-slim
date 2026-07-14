@@ -21,6 +21,17 @@ uv venv --python 3.12
 uv pip install -r requirements.txt
 ```
 
+The eval env (`PushTMobile-v0`) comes from the pusht-mobile repo — a Rust sim
+wheel plus a thin gymnasium wrapper, neither on PyPI:
+
+```bash
+uv pip install /workspace/pusht-mobile/rust/target/wheels/pusht_py-*.whl
+uv pip install -e /workspace/pusht-mobile/python
+```
+
+(If the wheel is missing, build it first:
+`maturin build --release -m rust/pusht-py/Cargo.toml` in pusht-mobile.)
+
 After a VM restart everything is still there — just run
 `source /workspace/uv/env.sh` (sets PATH + uv env vars), then
 `source .venv/bin/activate`.
@@ -33,10 +44,9 @@ Launch detached so the run survives the SSH session:
 cd /workspace/pusht-slim
 setsid bash -c 'source .venv/bin/activate && \
   export WANDB_API_KEY=$(tr -d "[:space:]" < ~/.wandb_personal_key) && \
-  export SDL_VIDEODRIVER=dummy && \
   exec python -u train.py' > train.log 2>&1 < /dev/null & disown
 tail -f train.log
 ```
 
-`SDL_VIDEODRIVER=dummy` makes pygame render headless for eval rollouts;
-`python -u` keeps `train.log` unbuffered.
+`python -u` keeps `train.log` unbuffered. (Eval rendering is plain PIL — no
+display or SDL workarounds needed.)

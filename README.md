@@ -2,7 +2,7 @@
 
 A minimal, single-file imitation-learning pipeline for the [PushT](https://github.com/huggingface/gym-pusht) task, in the spirit of [nanoGPT](https://github.com/karpathy/nanoGPT): dataset, model, training loop, and eval all live in `train.py` (~600 lines), configured by plain constants at the top of the file.
 
-The policy is a ~200M-parameter [DiT](https://arxiv.org/abs/2212.09748) trained with [flow matching](https://arxiv.org/abs/2210.02747) on the [`lerobot/pusht`](https://huggingface.co/datasets/lerobot/pusht) demonstrations. It reaches a success rate of ~0.6–0.7 after 100k steps (~3.5 h on an RTX 4090).
+The policy is a ~200M-parameter [DiT](https://arxiv.org/abs/2212.09748) trained with [flow matching](https://arxiv.org/abs/2210.02747) on the [`zaringleb/pusht_mobile_100`](https://huggingface.co/datasets/zaringleb/pusht_mobile_100) demonstrations — 100 episodes collected with the [pusht-mobile](https://github.com/Robot-Learning-Collective/pusht-mobile) teleop UI, whose Rapier2D sim (`PushTMobile-v0`) also serves as the eval environment.
 
 ## How it works
 
@@ -10,12 +10,16 @@ The policy is a ~200M-parameter [DiT](https://arxiv.org/abs/2212.09748) trained 
 - **Observation encoding** — frames are cropped to 84×84 (random in train, center in eval) and passed through a pretrained DINOv2 ViT-S/14, fine-tuned end-to-end. Its 6×6 patch grid is pooled by SpatialSoftmax into 32 keypoints. The 2-DoF robot state goes through a small MLP.
 - **Action generation** — a DiT with adaLN conditioning (image + state + flow time) predicts the velocity field of a flow from Gaussian noise to a 16-step action chunk. Inference is 10 Euler steps.
 - **Control** — receding horizon: predict 16 actions, execute 8, replan.
-- **Eval** — every 10k steps the policy is rolled out in `gym-pusht` for 50 episodes; success rate, average max reward, and 3 rollout videos are logged to wandb.
+- **Eval** — every 10k steps the policy is rolled out in `PushTMobile-v0` for 50 episodes; success rate, average max reward, and 3 rollout videos are logged to wandb.
 
 ## Run
 
+The env comes from the pusht-mobile repo (a Rust sim + a thin gymnasium wrapper, not on PyPI):
+
 ```bash
 pip install -r requirements.txt
+pip install <pusht-mobile>/rust/target/wheels/pusht_py-*.whl   # rust sim (build with maturin if absent)
+pip install -e <pusht-mobile>/python                           # registers PushTMobile-v0
 export WANDB_API_KEY=...   # metrics and eval videos go to wandb
 python train.py
 ```

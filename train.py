@@ -14,13 +14,13 @@ import torchvision.transforms as T
 from torchvision.io import read_video
 from huggingface_hub import hf_hub_download
 import gymnasium as gym
-import gym_pusht
+import pusht_mobile_env  # noqa: F401  (registers PushTMobile-v0)
 
 ROBOT_DOF = 2
 PREDICTION_HORIZON = 16
 ACTION_CHUNK_SIZE = 8
 N_DENOISING_STEPS = 10
-DATASET_ID = "lerobot/pusht"
+DATASET_ID = "zaringleb/pusht_mobile_100"
 # DiT sized to ~200M: hidden 896, 12 layers, 8 heads. Model scale was the
 # dominant success-rate lever in our experiments: ~47M plateaued at SR ~0.5,
 # 200M reaches ~0.6-0.7.
@@ -37,7 +37,7 @@ EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
 EVAL_VIDEOS = 3     # rollout videos logged to wandb per eval
 SAVE_EVERY = 20_000
-RUN_NAME = f"exp-dinov2-vits14-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"exp-mobile100-dinov2-vits14-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 NUM_WORKERS = 8  # dataloader workers
@@ -70,9 +70,9 @@ def unnormalize(x):
 # 1. Environment
 # =============================================================================
 def evaluate(policy, device, n_episodes=EVAL_EPISODES, n_videos=EVAL_VIDEOS):
-    env = gym.make(
-        "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode="rgb_array"
-    )
+    # PushTMobile-v0 natively matches gym_pusht's obs_type="pixels_agent_pos":
+    # obs = {"pixels": 96x96x3 uint8, "agent_pos": (2,) float64}, pixel actions.
+    env = gym.make("PushTMobile-v0", render_mode="rgb_array")
     policy.eval()
 
     successes = 0
