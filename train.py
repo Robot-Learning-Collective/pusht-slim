@@ -37,7 +37,7 @@ EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
 EVAL_VIDEOS = 3     # rollout videos logged to wandb per eval
 SAVE_EVERY = 20_000
-RUN_NAME = f"exp-dinov2-vits14-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"exp-dinov2-vits14-cls-cond-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 NUM_WORKERS = 8  # dataloader workers
@@ -241,8 +241,8 @@ class ImageEncoder(nn.Module):
         images = (images - self.img_mean) / self.img_std
 
         # (B, 36, embed_dim) patch tokens -> (B, embed_dim, 6, 6) feature map
-        tokens = self.backbone.forward_features(images)["x_norm_patchtokens"]
-        x = tokens.mean(dim=1)
+        features = self.backbone.forward_features(images)
+        x = features["x_norm_clstoken"]
         return self.fc(x)
 
 
