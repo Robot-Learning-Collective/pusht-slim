@@ -241,9 +241,8 @@ class ImageEncoder(nn.Module):
         images = (images - self.img_mean) / self.img_std
 
         # (B, 36, embed_dim) patch tokens -> (B, embed_dim, 6, 6) feature map
-        features = self.backbone.forward_features(images)
-        x = features["x_norm_clstoken"]
-        return self.fc(x)
+        tokens = self.backbone.forward_features(images)["x_norm_patchtokens"] 
+        return self.vision_proj(tokens)
 
 
 class StateEncoder(nn.Module):
@@ -281,12 +280,29 @@ class TimestepEncoder(nn.Module):
 class AdaLNBlock(nn.Module):
     def __init__(self, hidden_dim, n_heads):
         super().__init__()
-        # turns the conditioning vector into scale1, shift1, alpha1, scale2, shift2, alpha2
-        self.adaLN_modulation = nn.Linear(hidden_dim, hidden_dim * 6)
+
+        # Three sub-blocks:
+        # 1) self-attention
+        # 2) cross-attention to vision tokens
+        # 3) MLP
+        self.adaLN_modulation = nn.Linear(hidden_dim, hidden_dim * 9)
 
         self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm_cross = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.attention = nn.MultiheadAttention(hidden_dim, n_heads, batch_first=True)
+        self.vision_norm = nn.LayerNorm(hidden_dim)
+
+        self.attention = nn.MultiheadAttention(
+            hidden_dim,
+            n_heads,
+            batch_first=True,
+        )
+
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_dim,
+            n_heads,
+            batch_first=True,
+        )
 
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
@@ -297,22 +313,49 @@ class AdaLNBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation.weight)
         nn.init.zeros_(self.adaLN_modulation.bias)
 
-    def forward(self, x, cond):
-        # x: (batch, PREDICTION_HORIZON, hidden_dim), cond: (batch, hidden_dim)
-        scale1, shift1, alpha1, scale2, shift2, alpha2 = self.adaLN_modulation(
-            cond
-        ).chunk(6, dim=-1)
+    def forward(self, x, cond, vision_tokens):
+        (
+            scale1,
+            shift1,
+            alpha1,
+            scale_cross,
+            shift_cross,
+            alpha_cross,
+            scale2,
+            shift2,
+            alpha2,
+        ) = self.adaLN_modulation(cond).chunk(9, dim=-1)
 
-        # attention sub-block with adaptive LayerNorm
+        # 1) Action-token self-attention
         x1 = self.norm1(x)
         x1 = scale1.unsqueeze(1) * x1 + shift1.unsqueeze(1)
-        x1, _ = self.attention(x1, x1, x1)
+        x1, _ = self.attention(
+            x1,
+            x1,
+            x1,
+            need_weights=False,
+        )
         x = x + alpha1.unsqueeze(1) * x1
 
-        # MLP sub-block with adaptive LayerNorm
+        # 2) Action tokens cross-attend to vision tokens
+        x_cross = self.norm_cross(x)
+        x_cross = scale_cross.unsqueeze(1) * x_cross + shift_cross.unsqueeze(1)
+
+        vision = self.vision_norm(vision_tokens)
+
+        x_cross, _ = self.cross_attention(
+            query=x_cross,
+            key=vision,
+            value=vision,
+            need_weights=False,
+        )
+        x = x + alpha_cross.unsqueeze(1) * x_cross
+
+        # 3) MLP
         x2 = self.norm2(x)
         x2 = scale2.unsqueeze(1) * x2 + shift2.unsqueeze(1)
         x = x + alpha2.unsqueeze(1) * self.mlp(x2)
+
         return x
 
 
@@ -338,7 +381,7 @@ class DiTPolicy(nn.Module):
         )
 
         self.cond_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim * 4),
+            nn.Linear(hidden_dim * 2, hidden_dim * 4),
             nn.GELU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
@@ -354,17 +397,17 @@ class DiTPolicy(nn.Module):
         # pure network: noisy actions + time + context -> predicted velocity
         # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF) in [-1, 1], t: (batch,)
         # images: (batch, 3, 96, 96) uint8, obs: (batch, ROBOT_DOF) in pixels
-        images_cond = self.image_encoder(images)
-        obs_cond = self.state_encoder(obs)
-        timestep_cond = self.timestep_encoder(t)
-        cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
+        vision_tokens = self.image_encoder(images) 
+        obs_cond = self.state_encoder(obs) 
+        timestep_cond = self.timestep_encoder(t) 
+        cond = torch.cat( [obs_cond, timestep_cond], dim=-1, ) 
         cond = self.cond_proj(cond)
 
         x = self.action_proj(x_t)
         x = x + self.action_pos_emb
 
         for block in self.blocks:
-            x = block(x, cond)
+            x = block(x, cond, vision_tokens)
         return self.action_out(x)
 
     @torch.no_grad()
