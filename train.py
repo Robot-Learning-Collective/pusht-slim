@@ -242,7 +242,7 @@ class ImageEncoder(nn.Module):
 
         # (B, 36, embed_dim) patch tokens -> (B, embed_dim, 6, 6) feature map
         tokens = self.backbone.forward_features(images)["x_norm_patchtokens"] 
-        return self.vision_proj(tokens)
+        return self.fc(tokens)
 
 
 class StateEncoder(nn.Module):
