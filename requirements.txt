@@ -3,7 +3,10 @@ torchvision
 huggingface_hub
 pandas
 pyarrow  # pd.read_parquet
-gym-pusht==0.1.6
-pymunk==6.6.0
+gymnasium>=0.29
+# PushT mobile env (not on PyPI) — rust sim wheel + gym wrapper, from the
+# pusht-mobile repo:
+#   uv pip install <pusht-mobile>/rust/target/wheels/pusht_py-*.whl
+#   uv pip install -e <pusht-mobile>/python
 wandb
 moviepy  # wandb.Video mp4 encoding for eval rollout videos
