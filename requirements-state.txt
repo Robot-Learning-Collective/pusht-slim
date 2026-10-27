@@ -1,0 +1,10 @@
+torch>=2.4,<3
+numpy
+pandas
+pyarrow
+huggingface_hub
+gymnasium>=0.29
+wandb
+gym-pusht==0.1.6
+pymunk==6.6.0
+# Mobile mode additionally requires pusht_mobile_env and its pusht_core Rust extension.
